@@ -232,5 +232,13 @@ pub fn run_probe(
     providers: Vec<pay_types::registry::ProbeProvider>,
     config: &pay_core::skills::probe::ProbeConfig,
 ) -> ProbeReport {
-    pay_core::skills::probe::probe_providers(providers, config)
+    let mut report = pay_core::skills::probe::probe_providers(providers, config);
+    let rpc_url = pay_core::client::balance::mainnet_rpc_url();
+    if let Err(error) = pay_core::skills::probe::check_payee_accounts(&mut report, &rpc_url) {
+        eprintln!(
+            "  {} recipient account check skipped: {error}",
+            "!".yellow()
+        );
+    }
+    report
 }
