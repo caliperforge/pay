@@ -916,6 +916,18 @@ impl<S: PaymentState> PaymentGate<S> {
 
         if accepted.contains(&Scheme::X402Exact)
             && let Some(x402) = self.state.x402()
+            && self.state.fee_payer_signer().is_none()
+        {
+            // Settlement (`x402_exact_verify`) needs the fee-payer signer, so an
+            // offer made without one can be verified but never settled: every
+            // paying client would be refused. Don't advertise what we can't take.
+            telemetry::record_challenge_error(
+                "x402/exact",
+                x402.currency(),
+                "x402 exact not advertised: no fee-payer signer (set operator.fee_payer)",
+            );
+        } else if accepted.contains(&Scheme::X402Exact)
+            && let Some(x402) = self.state.x402()
         {
             let amount = crate::server::payment::charge_amount_from_price(price.as_ref());
             // Parity with MPP charge external_id: resource plus per-challenge
