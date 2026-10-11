@@ -44,6 +44,9 @@ pub enum EndpointVerdict {
     Indeterminate,
     /// Connection failure.
     Error,
+    /// Solana 402, but the recipient has no token account for any offered
+    /// stablecoin, so no buyer can pay it. Does not count toward "ok".
+    Unpayable,
 }
 
 /// Result of validating a single endpoint within a provider.
@@ -69,6 +72,8 @@ pub struct ProviderVerdict {
     pub non_solana_count: usize,
     /// Total number of warning-only, tolerated endpoints.
     pub tolerated_count: usize,
+    /// Endpoints whose recipient can't receive the offered stablecoin.
+    pub unpayable_count: usize,
     /// Whether the provider blocks the PR: zero `ok` endpoints and none
     /// credential-gated (`siwx_required` / `auth_required`), or `--strict`
     /// and any non-Solana endpoint.
@@ -117,6 +122,10 @@ fn verdict_for_provider(provider: &ProviderProbeResult, strict: bool) -> Provide
         .iter()
         .filter(|e| e.verdict == EndpointVerdict::ToleratedWarning)
         .count();
+    let unpayable_count = endpoints
+        .iter()
+        .filter(|e| e.verdict == EndpointVerdict::Unpayable)
+        .count();
 
     // Endpoints whose payment gate the probe legitimately can't reach —
     // payment sits behind sign-in (SIWX) or credentials (auth). These exempt a
@@ -150,6 +159,7 @@ fn verdict_for_provider(provider: &ProviderProbeResult, strict: bool) -> Provide
         ok_count,
         non_solana_count,
         tolerated_count,
+        unpayable_count,
         block,
     }
 }
@@ -196,6 +206,10 @@ fn verdict_for_endpoint(ep: &EndpointProbeResult) -> EndpointVerdictRow {
         "error" => (
             EndpointVerdict::Error,
             "probe failed (network/timeout)".into(),
+        ),
+        "payee_cannot_receive" => (
+            EndpointVerdict::Unpayable,
+            "recipient has no token account for the offered stablecoin — no buyer can pay".into(),
         ),
         other => (
             EndpointVerdict::Indeterminate,
@@ -333,6 +347,7 @@ pub fn render_verdict_table(report: &ValidationReport) {
                 EndpointVerdict::Free => "FREE".dimmed().to_string(),
                 EndpointVerdict::Indeterminate => "?".dimmed().to_string(),
                 EndpointVerdict::Error => "ERR".red().to_string(),
+                EndpointVerdict::Unpayable => "FAIL".red().to_string(),
             };
             eprintln!(
                 "  {icon}  {} {}  {} ({})",
@@ -389,12 +404,30 @@ pub fn render_verdict_github(report: &ValidationReport) {
                         msg = encode_actions(&format!("{} {} — {}", ep.method, ep.path, ep.note)),
                     );
                 }
+                EndpointVerdict::Unpayable => {
+                    println!(
+                        "::warning file={file},title={title}::{msg}",
+                        file = provider.file,
+                        title = encode_actions(&format!(
+                            "{}: recipient can't receive payment",
+                            provider.fqn
+                        )),
+                        msg = encode_actions(&format!("{} {} — {}", ep.method, ep.path, ep.note)),
+                    );
+                }
                 _ => {}
             }
         }
         if provider.block {
             let classifiable = provider.ok_count + provider.non_solana_count;
-            let msg = if classifiable == 0 {
+            let msg = if provider.ok_count == 0 && provider.unpayable_count > 0 {
+                format!(
+                    "{}: every Solana offer pays a recipient with no token account for the \
+                     offered stablecoin, so no buyer can pay. Create the recipient's \
+                     associated token account.",
+                    provider.fqn,
+                )
+            } else if classifiable == 0 {
                 format!(
                     "{}: no endpoint returned a Solana 402 challenge, and none are \
                      sign-in/auth gated. At least one Solana-payable endpoint is required.",
@@ -491,6 +524,26 @@ mod tests {
         assert!(v.providers[0].block);
         assert_eq!(v.providers[0].ok_count, 0);
         assert_eq!(v.providers[0].non_solana_count, 1);
+    }
+
+    #[test]
+    fn block_when_only_unpayable() {
+        let report = ProbeReport {
+            providers: vec![provider_result(
+                "foo/bar",
+                vec![ep_result("payee_cannot_receive", vec!["x402"])],
+            )],
+            total_endpoints: 1,
+            passed: 0,
+            failed: 1,
+        };
+        let v = validate_report(&report, false);
+        assert!(v.providers[0].block);
+        assert_eq!(v.providers[0].unpayable_count, 1);
+        assert_eq!(
+            v.providers[0].endpoints[0].verdict,
+            EndpointVerdict::Unpayable
+        );
     }
 
     #[test]
