@@ -217,11 +217,9 @@ pub fn extract_paid_endpoint(headers: &[(String, String)], body: Option<&str>) -
     let mut paid = PaidEndpoint::default();
 
     // ── x402 envelope ──
-    // The envelope may sit in the body or only in the `payment-required`
-    // header (base64 JSON). Many servers send a JSON error body *and* the
-    // header, so a body that parses but carries no `accepts` must not shadow
-    // the header — the payment client (`runner::classify_402`) reads the
-    // header in that case, and the index has to agree with it.
+    // Some servers (e.g. Vercel-hosted ones) ship an empty response body and
+    // put the entire envelope in the `payment-required` header (base64 JSON).
+    // Fall back to that when the body doesn't carry the envelope itself.
     let body_json: Option<Value> = body.and_then(|b| serde_json::from_str(b).ok());
     let parsed_body: Option<Value> = match (body_json, parse_payment_required_header(headers)) {
         (Some(b), _) if b.get("accepts").is_some() => Some(b),
