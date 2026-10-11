@@ -1579,9 +1579,7 @@ fn interpret_retry(
             body, content_type, ..
         } => Ok((body.unwrap_or_default(), content_type)),
         RunOutcome::PaymentRejected { reason, .. } => Err(pay_core::Error::PaymentRejected(reason)),
-        _ => Err(pay_core::Error::Mpp(
-            "Server returned 402 again after payment".to_string(),
-        )),
+        other => Err(pay_core::Error::Mpp(other.retry_rejection_message())),
     }
 }
 

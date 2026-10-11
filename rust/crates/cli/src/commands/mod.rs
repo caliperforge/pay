@@ -2119,14 +2119,12 @@ fn handle_retry_outcome(
             }
             std::process::exit(1);
         }
-        _ => {
+        other => {
+            let message = other.retry_rejection_message();
             if is_json {
-                output::error_json("Server returned 402 again after payment");
+                output::error_json(&message);
             } else {
-                eprintln!(
-                    "{}",
-                    "Error: Server returned 402 again after payment.".dimmed()
-                );
+                eprintln!("{}", format!("Error: {message}.").dimmed());
             }
             std::process::exit(1);
         }
@@ -2212,6 +2210,7 @@ mod tests {
                     "network": "mainnet"
                 }
             })],
+            x402_error: None,
         };
 
         let rendered = render_verbose_challenges(&challenges).unwrap();
