@@ -579,11 +579,12 @@ struct VerdictStats {
     classified: usize,
     non_solana: usize,
     tolerated: usize,
+    unpayable: usize,
 }
 
 impl VerdictStats {
     fn is_clean(&self) -> bool {
-        self.blocked == 0 && self.non_solana == 0 && self.tolerated == 0
+        self.blocked == 0 && self.non_solana == 0 && self.tolerated == 0 && self.unpayable == 0
     }
 
     fn format(
@@ -618,6 +619,13 @@ impl VerdictStats {
                 "{} parameterized 404 endpoint{} tolerated",
                 self.tolerated,
                 if self.tolerated == 1 { "" } else { "s" },
+            ));
+        }
+        if self.unpayable > 0 {
+            lines.push(format!(
+                "{} endpoint{} whose recipient can't receive the offered stablecoin",
+                self.unpayable,
+                if self.unpayable == 1 { "" } else { "s" },
             ));
         }
         if self.blocked > 0 {
@@ -657,7 +665,7 @@ fn render_markdown_summary(validation: &ValidationReport, static_warnings: &[Str
     let warns: usize = validation
         .providers
         .iter()
-        .map(|p| p.non_solana_count + p.tolerated_count)
+        .map(|p| p.non_solana_count + p.tolerated_count + p.unpayable_count)
         .sum();
     let oks: usize = validation.providers.iter().map(|p| p.ok_count).sum();
 
@@ -674,28 +682,28 @@ fn render_markdown_summary(validation: &ValidationReport, static_warnings: &[Str
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "| Provider | OK | Non-Solana | Tolerated 404 | Verdict |"
+        "| Provider | OK | Non-Solana | Tolerated 404 | Unpayable | Verdict |"
     );
     let _ = writeln!(
         out,
-        "|----------|----|------------|---------------|---------|"
+        "|----------|----|------------|---------------|-----------|---------|"
     );
     for p in &validation.providers {
         let v = if p.block {
             ":no_entry: BLOCK"
-        } else if p.non_solana_count > 0 || p.tolerated_count > 0 {
+        } else if p.non_solana_count > 0 || p.tolerated_count > 0 || p.unpayable_count > 0 {
             ":warning: warn"
         } else {
             ":white_check_mark: pass"
         };
         let _ = writeln!(
             out,
-            "| `{}` | {} | {} | {} | {} |",
-            p.fqn, p.ok_count, p.non_solana_count, p.tolerated_count, v
+            "| `{}` | {} | {} | {} | {} | {} |",
+            p.fqn, p.ok_count, p.non_solana_count, p.tolerated_count, p.unpayable_count, v
         );
     }
     for p in &validation.providers {
-        if p.non_solana_count == 0 && p.tolerated_count == 0 {
+        if p.non_solana_count == 0 && p.tolerated_count == 0 && p.unpayable_count == 0 {
             continue;
         }
         let _ = writeln!(out);
@@ -712,6 +720,7 @@ fn render_markdown_summary(validation: &ValidationReport, static_warnings: &[Str
                 ep.verdict,
                 super::verdict::EndpointVerdict::NotSolana
                     | super::verdict::EndpointVerdict::ToleratedWarning
+                    | super::verdict::EndpointVerdict::Unpayable
             ) {
                 continue;
             }
@@ -750,7 +759,8 @@ fn verdict_stats(validation: &ValidationReport) -> VerdictStats {
         .map(|p| p.non_solana_count)
         .sum();
     let tolerated: usize = validation.providers.iter().map(|p| p.tolerated_count).sum();
-    let classified = ok + non_solana;
+    let unpayable: usize = validation.providers.iter().map(|p| p.unpayable_count).sum();
+    let classified = ok + non_solana + unpayable;
     VerdictStats {
         providers,
         blocked,
@@ -758,6 +768,7 @@ fn verdict_stats(validation: &ValidationReport) -> VerdictStats {
         classified,
         non_solana,
         tolerated,
+        unpayable,
     }
 }
 
@@ -828,7 +839,57 @@ mod tests {
             classified: ok + non_solana,
             non_solana,
             tolerated: 0,
+            unpayable: 0,
         }
+    }
+
+    fn mixed_unpayable_report() -> ValidationReport {
+        use super::super::verdict::{EndpointVerdict, EndpointVerdictRow, ProviderVerdict};
+        let row = |path: &str, probe_status: &str, verdict| EndpointVerdictRow {
+            method: "GET".into(),
+            path: path.into(),
+            probe_status: probe_status.into(),
+            verdict,
+            note: String::new(),
+        };
+        ValidationReport {
+            providers: vec![ProviderVerdict {
+                fqn: "foo/bar".into(),
+                file: "providers/foo/bar/PAY.md".into(),
+                endpoints: vec![
+                    row("a", "ok", EndpointVerdict::Ok),
+                    row("b", "payee_cannot_receive", EndpointVerdict::Unpayable),
+                    row("c", "payee_cannot_receive", EndpointVerdict::Unpayable),
+                ],
+                ok_count: 1,
+                non_solana_count: 0,
+                tolerated_count: 0,
+                unpayable_count: 2,
+                block: false,
+            }],
+            strict: false,
+        }
+    }
+
+    #[test]
+    fn verdict_stats_warns_when_unpayable_present() {
+        let s = verdict_stats(&mixed_unpayable_report());
+        assert!(!s.is_clean());
+        assert_eq!(
+            s.format(3, 2, 0),
+            "3 endpoints tested across 1 provider\n\
+             1/3 gates compatible with Solana\n\
+             2 endpoints whose recipient can't receive the offered stablecoin"
+        );
+    }
+
+    #[test]
+    fn markdown_summary_flags_unpayable() {
+        let md = render_markdown_summary(&mixed_unpayable_report(), &[]);
+        assert!(md.contains(":warning: 2 endpoint warning(s)"));
+        assert!(md.contains("| `foo/bar` | 1 | 0 | 0 | 2 | :warning: warn |"));
+        assert!(md.contains("| `GET` | `b` | `payee_cannot_receive` |"));
+        assert!(!md.contains(":white_check_mark:"));
     }
 
     #[test]

@@ -69,6 +69,13 @@ fn is_solana_network(raw: &str) -> bool {
         || raw.eq_ignore_ascii_case("solana-mainnet")
 }
 
+fn is_solana_mainnet(raw: &str) -> bool {
+    raw == "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+        || ["solana", "solana-mainnet", "mainnet-beta", "mainnet"]
+            .iter()
+            .any(|name| raw.eq_ignore_ascii_case(name))
+}
+
 /// Convert a base-units string (e.g. `"10000"` of 6-decimal USDC) to USD.
 fn amount_to_usd(amount_str: &str, decimals: u8) -> Option<f64> {
     let raw: u128 = amount_str.parse().ok()?;
@@ -800,7 +807,7 @@ fn receiving_accounts(ep: &EndpointProbeResult) -> Vec<String> {
     let ProbeStatus::Ok { network, .. } = &ep.status else {
         return Vec::new();
     };
-    if ep.probe_status != "ok" || !network.contains("mainnet") {
+    if ep.probe_status != "ok" || !is_solana_mainnet(network) {
         return Vec::new();
     }
     let ata_program = Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM).expect("valid program id");
@@ -896,6 +903,13 @@ pub fn check_payee_accounts(report: &mut ProbeReport, rpc_url: &str) -> crate::R
                 parsed["error"]
             ))
         })?;
+        if values.len() < chunk.len() {
+            return Err(crate::Error::Config(format!(
+                "RPC getMultipleAccounts returned {} of {} accounts",
+                values.len(),
+                chunk.len()
+            )));
+        }
         for (address, value) in chunk.iter().zip(values) {
             if !value.is_null() {
                 existing.insert(address.clone());
@@ -955,6 +969,18 @@ mod tests {
         assert_eq!(provider.endpoints[0].probe_status, "payee_cannot_receive");
         assert!(!provider.pass);
         assert_eq!((report.passed, report.failed), (0, 1));
+    }
+
+    #[test]
+    fn caip2_mainnet_payee_without_account_is_flagged() {
+        let mut report = one_endpoint_report(mainnet_usdc_endpoint(
+            "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+        ));
+        assert_eq!(apply_payee_accounts(&mut report, &Default::default()), 1);
+        assert_eq!(
+            report.providers[0].endpoints[0].probe_status,
+            "payee_cannot_receive"
+        );
     }
 
     #[test]
