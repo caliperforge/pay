@@ -1579,9 +1579,7 @@ fn interpret_retry(
             body, content_type, ..
         } => Ok((body.unwrap_or_default(), content_type)),
         RunOutcome::PaymentRejected { reason, .. } => Err(pay_core::Error::PaymentRejected(reason)),
-        _ => Err(pay_core::Error::Mpp(
-            "Server returned 402 again after payment".to_string(),
-        )),
+        other => Err(pay_core::Error::Mpp(other.retry_rejection_message())),
     }
 }
 
@@ -2302,5 +2300,22 @@ mod tests {
             Some("video/mp4")
         );
         assert_eq!(sniff_media_mime(b"just some plain text here"), None);
+    }
+
+    #[test]
+    fn interpret_retry_shows_seller_x402_error() {
+        use pay_core::client::runner::{DecodedPaymentChallenges, RunOutcome};
+        let outcome = RunOutcome::UnknownPaymentRequired {
+            headers: Vec::new(),
+            advertised_challenges: DecodedPaymentChallenges {
+                x402_error: Some("Nonce already used".to_string()),
+                ..Default::default()
+            },
+            resource_url: "https://example.com/r".to_string(),
+        };
+        let Err(err) = interpret_retry(outcome) else {
+            panic!("402 retry is an error");
+        };
+        assert!(err.to_string().contains("Nonce already used"));
     }
 }

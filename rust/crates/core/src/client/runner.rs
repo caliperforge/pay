@@ -17,6 +17,9 @@ pub struct DecodedPaymentChallenges {
     pub x402: Vec<serde_json::Value>,
     /// Every MPP challenge with its base64url payload fields decoded as JSON.
     pub mpp: Vec<serde_json::Value>,
+    /// The `error` string of the x402 envelope, when the server sent one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x402_error: Option<String>,
 }
 
 impl DecodedPaymentChallenges {
@@ -554,6 +557,55 @@ impl RawMessageSupport {
 }
 
 impl RunOutcome {
+    /// Message for a paid retry that came back 402 without a recognized
+    /// rejection body, carrying the seller's x402 `error` when it sent one.
+    pub fn retry_rejection_message(&self) -> String {
+        const BASE: &str = "Server returned 402 again after payment";
+        let reason = match self {
+            RunOutcome::MppChallenge {
+                advertised_challenges: c,
+                ..
+            }
+            | RunOutcome::SessionChallenge {
+                advertised_challenges: c,
+                ..
+            }
+            | RunOutcome::SubscriptionChallenge {
+                advertised_challenges: c,
+                ..
+            }
+            | RunOutcome::X402Challenge {
+                advertised_challenges: c,
+                ..
+            }
+            | RunOutcome::X402UptoChallenge {
+                advertised_challenges: c,
+                ..
+            }
+            | RunOutcome::X402BatchChallenge {
+                advertised_challenges: c,
+                ..
+            }
+            | RunOutcome::X402SignInChallenge {
+                advertised_challenges: c,
+                ..
+            }
+            | RunOutcome::UnknownPaymentRequired {
+                advertised_challenges: c,
+                ..
+            }
+            | RunOutcome::PaymentRejected {
+                advertised_challenges: c,
+                ..
+            } => c.x402_error.as_deref(),
+            RunOutcome::Completed { .. } => None,
+        };
+        match reason {
+            Some(reason) => format!("{BASE}: {reason}"),
+            None => BASE.to_string(),
+        }
+    }
+
     /// A 402 that names a payment pay knows how to make.
     fn is_payment_challenge(&self) -> bool {
         matches!(
@@ -789,11 +841,13 @@ pub fn decode_payment_challenges(
         .collect();
 
     let mut x402 = Vec::new();
+    let mut x402_error = None;
     for (name, value) in headers {
         if (name.eq_ignore_ascii_case(pay_kit::x402::PAYMENT_REQUIRED_HEADER)
             || name.eq_ignore_ascii_case(pay_kit::x402::X402_V1_PAYMENT_REQUIRED_HEADER))
             && let Some(decoded) = decode_json_value(value)
         {
+            x402_error = x402_error.or_else(|| envelope_error(&decoded));
             append_x402_challenges(&mut x402, decoded, true);
         }
     }
@@ -801,13 +855,25 @@ pub fn decode_payment_challenges(
     // x402 also permits the payment-required envelope in the response body.
     // Only treat it as such when it self-identifies, so an arbitrary JSON
     // error body is never mislabeled as a payment challenge.
-    if x402.is_empty()
-        && let Some(decoded) = body.and_then(decode_json_value)
-    {
-        append_x402_challenges(&mut x402, decoded, false);
+    if let Some(decoded) = body.and_then(decode_json_value) {
+        if decoded.get("x402Version").is_some() {
+            x402_error = x402_error.or_else(|| envelope_error(&decoded));
+        }
+        if x402.is_empty() {
+            append_x402_challenges(&mut x402, decoded, false);
+        }
     }
 
-    DecodedPaymentChallenges { x402, mpp }
+    DecodedPaymentChallenges {
+        x402,
+        mpp,
+        x402_error,
+    }
+}
+
+fn envelope_error(envelope: &serde_json::Value) -> Option<String> {
+    let error = envelope.get("error")?.as_str()?.trim();
+    (!error.is_empty()).then(|| error.to_string())
 }
 
 fn append_x402_challenges(
@@ -3320,5 +3386,74 @@ HTTP request sent, awaiting response...
     fn check_command_exists_fails_for_nonexistent() {
         let result = check_command_exists("nonexistent_command_xyz_12345");
         assert!(result.is_err());
+    }
+
+    fn replay_envelope(error: Option<&str>) -> serde_json::Value {
+        let mut envelope = serde_json::json!({
+            "x402Version": 2,
+            "resource": { "url": "https://example.com/r" },
+            "accepts": [{
+                "scheme": "exact",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "amount": "110000",
+                "payTo": "P9Mqh3W5sR5CqJAWYJFQePVaUs5GBfnonsaCdT7FbEQ",
+                "maxTimeoutSeconds": 60,
+                "extra": { "feePayer": "2jMbAFjK2joDBaecvvNDBKU1BTyj3FuvV1ZTmvTkKQu8" }
+            }]
+        });
+        if let Some(error) = error {
+            envelope["error"] = serde_json::json!(error);
+        }
+        envelope
+    }
+
+    #[test]
+    fn retry_message_shows_header_reason() {
+        use base64::Engine;
+        let header = base64::engine::general_purpose::STANDARD
+            .encode(replay_envelope(Some("Nonce already used (replay detected)")).to_string());
+        let outcome = classify_402(
+            &[("payment-required".to_string(), header)],
+            None,
+            "https://example.com/r",
+        );
+        assert_eq!(
+            outcome.retry_rejection_message(),
+            "Server returned 402 again after payment: Nonce already used (replay detected)"
+        );
+    }
+
+    #[test]
+    fn retry_message_shows_body_reason() {
+        let body = replay_envelope(Some("Missing signature or authorization payload")).to_string();
+        let outcome = classify_402(&[], Some(&body), "https://example.com/r");
+        assert_eq!(
+            outcome.retry_rejection_message(),
+            "Server returned 402 again after payment: Missing signature or authorization payload"
+        );
+    }
+
+    #[test]
+    fn retry_message_without_reason() {
+        let body = replay_envelope(None).to_string();
+        let outcome = classify_402(&[], Some(&body), "https://example.com/r");
+        assert_eq!(
+            outcome.retry_rejection_message(),
+            "Server returned 402 again after payment"
+        );
+    }
+
+    #[test]
+    fn unrelated_json_body_is_not_a_reason() {
+        let outcome = classify_402(
+            &[],
+            Some(r#"{"error":"upstream timeout"}"#),
+            "https://example.com/r",
+        );
+        assert_eq!(
+            outcome.retry_rejection_message(),
+            "Server returned 402 again after payment"
+        );
     }
 }
