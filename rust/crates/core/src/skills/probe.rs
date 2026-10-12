@@ -69,6 +69,13 @@ fn is_solana_network(raw: &str) -> bool {
         || raw.eq_ignore_ascii_case("solana-mainnet")
 }
 
+fn is_solana_mainnet(raw: &str) -> bool {
+    raw == "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+        || ["solana", "solana-mainnet", "mainnet-beta", "mainnet"]
+            .iter()
+            .any(|name| raw.eq_ignore_ascii_case(name))
+}
+
 /// Convert a base-units string (e.g. `"10000"` of 6-decimal USDC) to USD.
 fn amount_to_usd(amount_str: &str, decimals: u8) -> Option<f64> {
     let raw: u128 = amount_str.parse().ok()?;
@@ -766,9 +773,239 @@ pub fn pricing_from_probe(paid: &PaidEndpoint) -> Option<Value> {
     }))
 }
 
+// ── Recipient check ──────────────────────────────────────────────────────────
+//
+// A Solana stablecoin payment lands in the recipient's associated token
+// account. When none exists for any advertised mint, no buyer can pay the
+// endpoint, however well-formed its 402 is.
+
+const ASSOCIATED_TOKEN_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+const TOKEN_PROGRAMS: [&str; 2] = [
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+];
+
+fn mainnet_mint(symbol: &str) -> Option<&'static str> {
+    use pay_types::stablecoin_mints as mints;
+    match symbol {
+        "USDC" => Some(mints::USDC_MAINNET),
+        "USDT" => Some(mints::USDT_MAINNET),
+        "PYUSD" => Some(mints::PYUSD_MAINNET),
+        "CASH" => Some(mints::CASH_MAINNET),
+        "USDG" => Some(mints::USDG_MAINNET),
+        _ => None,
+    }
+}
+
+/// Every account a payment to `ep` could land in: each advertised recipient
+/// × each advertised mainnet stablecoin, under both token programs. Empty
+/// when the endpoint isn't a payable mainnet Solana offer.
+fn receiving_accounts(ep: &EndpointProbeResult) -> Vec<String> {
+    use solana_pubkey::Pubkey;
+    use std::str::FromStr;
+
+    let ProbeStatus::Ok { network, .. } = &ep.status else {
+        return Vec::new();
+    };
+    if ep.probe_status != "ok" || !is_solana_mainnet(network) {
+        return Vec::new();
+    }
+    let ata_program = Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM).expect("valid program id");
+    let mut accounts = Vec::new();
+    for recipient in &ep.paid.recipients {
+        let Ok(owner) = Pubkey::from_str(recipient) else {
+            continue;
+        };
+        for symbol in &ep.paid.supported_usd {
+            let Some(mint) = mainnet_mint(symbol).and_then(|m| Pubkey::from_str(m).ok()) else {
+                continue;
+            };
+            for program in TOKEN_PROGRAMS {
+                let program = Pubkey::from_str(program).expect("valid program id");
+                let (ata, _) = Pubkey::find_program_address(
+                    &[owner.as_ref(), program.as_ref(), mint.as_ref()],
+                    &ata_program,
+                );
+                accounts.push(ata.to_string());
+            }
+        }
+    }
+    accounts
+}
+
+/// Re-tag as `payee_cannot_receive` every endpoint none of whose receiving
+/// accounts is in `existing`. Returns how many endpoints were re-tagged.
+pub fn apply_payee_accounts(
+    report: &mut ProbeReport,
+    existing: &std::collections::HashSet<String>,
+) -> usize {
+    let mut flagged = 0;
+    for provider in &mut report.providers {
+        for ep in &mut provider.endpoints {
+            let accounts = receiving_accounts(ep);
+            if accounts.is_empty() || accounts.iter().any(|a| existing.contains(a)) {
+                continue;
+            }
+            ep.status = ProbeStatus::Error {
+                message: format!(
+                    "recipient {} has no {} token account",
+                    ep.paid.recipients.join(", "),
+                    ep.paid.supported_usd.join("/")
+                ),
+            };
+            ep.probe_status = "payee_cannot_receive".into();
+            flagged += 1;
+        }
+        provider.pass = provider.endpoints.iter().all(|e| e.status.is_ok());
+    }
+    report.passed = report.passed.saturating_sub(flagged);
+    report.failed += flagged;
+    flagged
+}
+
+/// Look up which receiving accounts exist on mainnet (one batched read per
+/// 100 accounts) and re-tag the endpoints no buyer can pay. On a failed
+/// lookup the report is left unchanged and the error returned.
+pub fn check_payee_accounts(report: &mut ProbeReport, rpc_url: &str) -> crate::Result<usize> {
+    let mut candidates: Vec<String> = report
+        .providers
+        .iter()
+        .flat_map(|p| &p.endpoints)
+        .flat_map(receiving_accounts)
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+
+    let mut existing = std::collections::HashSet::new();
+    for chunk in candidates.chunks(100) {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getMultipleAccounts",
+            "params": [chunk, {
+                "encoding": "base64",
+                "dataSlice": { "offset": 0, "length": 0 },
+                "commitment": "confirmed"
+            }]
+        });
+        let response = fetch_raw(
+            "POST",
+            rpc_url,
+            &[("content-type".to_string(), "application/json".to_string())],
+            Some(&request.to_string()),
+        )?;
+        let parsed: Value = serde_json::from_slice(&response.body).map_err(|e| {
+            crate::Error::Config(format!("RPC returned HTTP {}: {e}", response.status))
+        })?;
+        let values = parsed["result"]["value"].as_array().ok_or_else(|| {
+            crate::Error::Config(format!(
+                "RPC getMultipleAccounts failed: {}",
+                parsed["error"]
+            ))
+        })?;
+        if values.len() < chunk.len() {
+            return Err(crate::Error::Config(format!(
+                "RPC getMultipleAccounts returned {} of {} accounts",
+                values.len(),
+                chunk.len()
+            )));
+        }
+        for (address, value) in chunk.iter().zip(values) {
+            if !value.is_null() {
+                existing.insert(address.clone());
+            }
+        }
+    }
+    Ok(apply_payee_accounts(report, &existing))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mainnet_usdc_endpoint(network: &str) -> EndpointProbeResult {
+        EndpointProbeResult {
+            method: "GET".into(),
+            path: "v1/foo".into(),
+            url: "https://api.example.com/v1/foo".into(),
+            status: ProbeStatus::Ok {
+                protocol: "x402".into(),
+                currency: "USDC".into(),
+                network: network.into(),
+                recipient: "BENrLoUbndxoNMUS5JXApGMtNykLjFXXixMtpDwDR9SP".into(),
+            },
+            paid: PaidEndpoint {
+                protocols: vec!["x402".into()],
+                supported_usd: vec!["USDC".into()],
+                price_usd: Some(0.01),
+                recipients: vec!["BENrLoUbndxoNMUS5JXApGMtNykLjFXXixMtpDwDR9SP".into()],
+                ..Default::default()
+            },
+            probe_status: "ok".into(),
+            http_status: 402,
+            duration_ms: 1,
+        }
+    }
+
+    fn one_endpoint_report(ep: EndpointProbeResult) -> ProbeReport {
+        ProbeReport {
+            providers: vec![ProviderProbeResult {
+                fqn: "foo/bar".into(),
+                service_url: "https://api.example.com".into(),
+                endpoints: vec![ep],
+                pass: true,
+            }],
+            total_endpoints: 1,
+            passed: 1,
+            failed: 0,
+        }
+    }
+
+    #[test]
+    fn payee_without_account_is_flagged() {
+        let mut report = one_endpoint_report(mainnet_usdc_endpoint("mainnet"));
+        assert_eq!(apply_payee_accounts(&mut report, &Default::default()), 1);
+        let provider = &report.providers[0];
+        assert_eq!(provider.endpoints[0].probe_status, "payee_cannot_receive");
+        assert!(!provider.pass);
+        assert_eq!((report.passed, report.failed), (0, 1));
+    }
+
+    #[test]
+    fn caip2_mainnet_payee_without_account_is_flagged() {
+        let mut report = one_endpoint_report(mainnet_usdc_endpoint(
+            "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+        ));
+        assert_eq!(apply_payee_accounts(&mut report, &Default::default()), 1);
+        assert_eq!(
+            report.providers[0].endpoints[0].probe_status,
+            "payee_cannot_receive"
+        );
+    }
+
+    #[test]
+    fn payee_with_account_stays_ok() {
+        let ep = mainnet_usdc_endpoint("mainnet");
+        let existing = receiving_accounts(&ep).into_iter().take(1).collect();
+        let mut report = one_endpoint_report(ep);
+        assert_eq!(apply_payee_accounts(&mut report, &existing), 0);
+        assert_eq!(report.providers[0].endpoints[0].probe_status, "ok");
+    }
+
+    #[test]
+    fn devnet_payee_is_not_checked() {
+        let mut report = one_endpoint_report(mainnet_usdc_endpoint("devnet"));
+        assert_eq!(apply_payee_accounts(&mut report, &Default::default()), 0);
+        assert_eq!(report.providers[0].endpoints[0].probe_status, "ok");
+    }
+
+    #[test]
+    fn receiving_accounts_cover_both_token_programs() {
+        assert_eq!(
+            receiving_accounts(&mainnet_usdc_endpoint("mainnet")).len(),
+            2
+        );
+    }
 
     fn x402_body(accepts: Vec<Value>) -> String {
         serde_json::json!({
