@@ -2301,4 +2301,21 @@ mod tests {
         );
         assert_eq!(sniff_media_mime(b"just some plain text here"), None);
     }
+
+    #[test]
+    fn interpret_retry_shows_seller_x402_error() {
+        use pay_core::client::runner::{DecodedPaymentChallenges, RunOutcome};
+        let outcome = RunOutcome::UnknownPaymentRequired {
+            headers: Vec::new(),
+            advertised_challenges: DecodedPaymentChallenges {
+                x402_error: Some("Nonce already used".to_string()),
+                ..Default::default()
+            },
+            resource_url: "https://example.com/r".to_string(),
+        };
+        let Err(err) = interpret_retry(outcome) else {
+            panic!("402 retry is an error");
+        };
+        assert!(err.to_string().contains("Nonce already used"));
+    }
 }

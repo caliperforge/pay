@@ -17,8 +17,7 @@ pub struct DecodedPaymentChallenges {
     pub x402: Vec<serde_json::Value>,
     /// Every MPP challenge with its base64url payload fields decoded as JSON.
     pub mpp: Vec<serde_json::Value>,
-    /// The `error` string of the x402 envelope, when the server sent one. On
-    /// a paid retry this is usually the seller's reason for the rejection.
+    /// The `error` string of the x402 envelope, when the server sent one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub x402_error: Option<String>,
 }
@@ -856,15 +855,13 @@ pub fn decode_payment_challenges(
     // x402 also permits the payment-required envelope in the response body.
     // Only treat it as such when it self-identifies, so an arbitrary JSON
     // error body is never mislabeled as a payment challenge.
-    if let Some(decoded) = body.and_then(decode_json_value)
-        && decoded.get("x402Version").is_some()
-    {
-        x402_error = x402_error.or_else(|| envelope_error(&decoded));
-    }
-    if x402.is_empty()
-        && let Some(decoded) = body.and_then(decode_json_value)
-    {
-        append_x402_challenges(&mut x402, decoded, false);
+    if let Some(decoded) = body.and_then(decode_json_value) {
+        if decoded.get("x402Version").is_some() {
+            x402_error = x402_error.or_else(|| envelope_error(&decoded));
+        }
+        if x402.is_empty() {
+            append_x402_challenges(&mut x402, decoded, false);
+        }
     }
 
     DecodedPaymentChallenges {
