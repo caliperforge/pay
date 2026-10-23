@@ -25,17 +25,21 @@ hand-copied program logic or account layout.
 - A transaction is only signed and sent when **`DRY_RUN=false`** is explicitly
   set. Any other value (unset, `true`, `1`, garbage) keeps dry-run on.
 - Always run a dry-run first and read the plan before setting `DRY_RUN=false`.
-- `close-channels` requires an existing, unbound session record before acting
+- The V1 `close-channels` path requires an existing, unbound session record before acting
   when Redis is configured. Missing, malformed, or deployment-bound ownership
   is not permission to adopt a channel discovered on-chain. Live runs require
   Redis; a dry-run without Redis cannot establish ownership.
+- Atomic V2 charges have one narrow exception: automatic discovery on `devnet`
+  or `localnet` can reclaim already-`Distributed` channels whose immutable rent
+  payer is the configured fee-payer signer. No session record is needed for
+  that reclaim-only path; it cannot seal, distribute, fund, or settle a channel.
 
 ## Environment variables
 
 | Var | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `CHANNEL_ADDRESSES` | no | empty | Comma-separated base58 channel pubkeys. Empty scans all on-chain `Distributed` channels for rent reclaim. |
-| `NETWORK` | no | `mainnet` | `mainnet` or `sandbox`; selects the RPC + treasury. |
+| `NETWORK` | no | `mainnet` | Selects the RPC + treasury. `mainnet` and `sandbox` have defaults; `devnet` or `localnet` require `RPC_URL` or a `JOBS_NETWORKS__*__RPC_URL` override and enable V2 rent recovery. |
 | `RPC_URL` | no | per-network YAML | Overrides the RPC URL for the active network (Helius, etc.). |
 | `DRY_RUN` | no | `true` | `false` to actually sign + broadcast. Anything else = dry-run. |
 | `PAY_API_SEND__FEE_PAYER__KEY_NAME` | prod | — | GCP KMS key resource name of the fee payer. |
@@ -49,7 +53,7 @@ hand-copied program logic or account layout.
 | `PAY_SESSION_REDIS_PREFIX` | no | — | Legacy fallback for `PAY_MPP_REDIS_PREFIX`. |
 | `PAY_SESSION_FINALIZED_RETENTION_SECONDS` | no | — | Legacy fallback for `PAY_MPP_FINALIZED_RETENTION_SECONDS`. |
 | `PAY_X402_REDIS_URL` | no | MPP Redis URL | x402 Redis URL shared with the gateway. |
-| `PAY_X402_REDIS_PREFIX` | no | `pay:batch:v1:` | x402 batch channel key namespace; must match the gateway. |
+| `PAY_X402_REDIS_PREFIX` | no | `pay:batch:v1:` on mainnet, `pay:batch:v1:<network>:` otherwise (`sandbox` uses `localnet`) | x402 batch channel key namespace; must match the gateway, which namespaces batch channels per network. |
 | `PAY_X402_SETTLE_ACTIVE_CHANNELS` | no | `false` | Include active channels with positive off-chain watermarks in every worker run. Keep false for idle-only production reconciliation; enable it for an explicitly scheduled full-fleet sweep. |
 | `PAY_X402_DISTRIBUTION_THRESHOLD_BASE_UNITS` | no | unset | Per-channel claimed-but-undistributed token balance that triggers distribution from an open channel. Must be greater than zero. Unset keeps intermediate claims in escrow; closing and sealed channels are still finalized regardless. |
 | `PAY_X402_SETTLEMENT_MAX_IDLE_SECONDS` | no | `300` | Settle a positive residual after the channel has remained untouched for this long. Closing and sealed channels are never deferred. |
@@ -58,7 +62,7 @@ hand-copied program logic or account layout.
 | `SETTLEMENT_LOCK_TTL_SECONDS` | no | `300` | TTL for each scheme's independent reconciliation lease. |
 | `RUN_ONCE` | no | `true` | Keep one-shot behavior for manual Cloud Run Job executions. Set to `false` for the continuous worker. |
 | `SETTLEMENT_INTERVAL_SECONDS` | no | `10` | Delay between complete MPP and x402 reconciliation sweeps when `RUN_ONCE=false`. Set this to `240` for a four-minute x402 settlement clock. |
-| `PAY_RESOURCE_CLEANUP_DRIVERS` | no | empty | Comma-separated cleanup drivers: `google-cloud-functions`, `gcp-firestore`. Unknown entries fail startup instead of silently leaking resources. |
+| `PAY_RESOURCE_CLEANUP_DRIVERS` | yes | — | Comma-separated cleanup drivers for every resource-backed service: `google-cloud-functions`, `gcp-firestore`, `google-cloud-scheduler`, or exactly `none` when no service leases resources to channels. Unset, empty, unknown or duplicate entries fail startup instead of silently leaking resources. |
 | `PAY_RESOURCE_CLEANUP_INTERVAL_SECONDS` | no | `60` | Minimum delay between provider cleanup scans for one channel. |
 | `PAY_RESOURCE_CLEANUP_QUIET_SECONDS` | no | `7200` | Repeated-empty-scan window before the Redis retry anchor may be removed. |
 
@@ -106,6 +110,24 @@ sweep on a cadence longer than the expected job runtime to avoid overlapping
 executions. The Redis lease also rejects an overlapping run, so reclaim work
 survives proxy restarts and does not depend on an in-process timer.
 
+### Atomic V2 charge rent
+
+For scheduled V2 rent recovery, leave `CHANNEL_ADDRESSES` empty, set `NETWORK`
+to `devnet` or `localnet`, and configure its `RPC_URL` and the same fee-payer
+signer that sponsored the charges. Start with `DRY_RUN=true`. Live runs still
+require `PAY_MPP_REDIS_URL` (or `PAY_SESSION_REDIS_URL`) for reclaim leases.
+Explicit address maintenance remains V1-only.
+
+The job scans only the canonical V2 program
+`CHNLxBtXw7VPqd5GMcbtVoEbn4ehyaSoiHj56Ao5sWkJ`, with RPC account-size and
+configured rent-payer filters. The shared RPC wrapper supports one memcmp filter,
+so the worker checks `Distributed` status locally. It verifies owner, layout, version,
+callback guard, status, rent payer, and `current_slot > open_slot + 1500` on a
+fresh account fetch under the lease and again before each reclaim batch.
+Closed accounts are skipped. Reclaim uses the existing native instruction,
+invokes no hooks, and shares the existing transaction-size bounds and dry-run
+behavior. No V2 discovery runs on `mainnet`, `sandbox`, or other network labels.
+
 Non-reclaim state-machine steps remain separate transactions because later
 steps depend on state produced by earlier ones. Each transaction uses the KMS
 pubkey as fee payer, a freshly fetched blockhash, and the async KMS
@@ -122,15 +144,18 @@ and batch namespaces can progress independently.
 
 For legacy MPP sessions it cursor-scans the session namespace, skips sealed and
 pull-mode records, and fetches every candidate channel from Solana. If a
-push-channel account is already absent at confirmed commitment, the worker
-deletes its terminal Redis record after resource cleanup completes. For active
+push-channel account is absent, the worker deletes its Redis record only once a
+finalized read past `open_slot + OPEN_SLOT_WINDOW` (or the program's closed
+tombstone) proves it gone, and after resource cleanup completes. For active
 channels it submits a voucher only when the stored cumulative amount is
 strictly greater than the on-chain watermark. For idle channels it atomically
 claims the still-due Redis deadline, settles the latest voucher, seals, and
 distributes the channel.
 
 The same sweep garbage-collects provider resources leased to an MPP channel
-once it is spent, closing, sealed, or absent on-chain. Compute functions,
+once it is terminal: sealed or distributed on-chain, sealed in Redis after a
+confirmed close, or proven absent. A close request alone never triggers
+cleanup, since its transaction can still fail. Compute functions,
 schedule triggers, and managed document stores carry a one-way hash of the
 verified channel ID. Cleanup is provider-driver based and retry-safe. The
 store-backed close deadline prevents cleanup racing a top-up. The
@@ -253,14 +278,17 @@ wallet proofs, Redis URLs, KMS keys, or chain RPC secrets to this job.
 `sha256` hash is stored on-chain. The job recovers the preimage from the
 channel's **open** (creation) transaction:
 
-1. `getSignaturesForAddress(channel)`, paginated to the OLDEST signature — that
-   is the `open`.
-2. `getTransaction(sig, base64)`, bincode-decoded; find the instruction whose
-   program id is the payment-channels program and whose `data[0] == 1` (the
-   `open` discriminator).
-3. The `open` ix data is `[disc(1)][salt(8)][deposit(8)][grace(4)][open_slot(8)][count(4)][entries(count×34)]`.
-   The preimage = `ix_data[29..]` = `count || entries` (each entry =
-   `recipient(32) || bps(2 LE)`), which is exactly the borsh encoding of the
+1. `getSignaturesForAddress(channel)`, paginated, keeping only successful
+   transactions in the slots an open can land in
+   (`open_slot ..= open_slot + OPEN_SLOT_WINDOW`). Anyone can mention the PDA
+   before it exists, so the oldest mention is not assumed to be the open.
+2. Oldest first, `getTransaction(sig, base64)` is decoded and accepted only if
+   an instruction is the payment-channels `open` that names this channel and
+   whose own accounts and arguments derive its PDA
+   (`payment_channels::decode_open_for_channel`). Anything else is skipped;
+   exhausting the candidates is `OpenTxNotFound`.
+3. The preimage is the borsh encoding of the open's `recipients`
+   (`count || entries`, each entry `recipient(32) || bps(2 LE)`), exactly the
    `DistributeArgs.recipients` vector.
 4. The recipient-ATA remaining-accounts tail = `ATA(recipient, mint, token_program)`
    per entry, in order.

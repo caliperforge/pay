@@ -5,11 +5,16 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 bs58 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+sha2 = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 secret-service = { version = "3", features = ["rt-tokio-crypto-rust"] }

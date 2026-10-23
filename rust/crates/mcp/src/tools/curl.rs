@@ -59,11 +59,37 @@ impl SessionCache {
 /// by the configured HTTP method and path. Including the method avoids the
 /// server's session-credential path fallback sharing a channel with another
 /// operation that happens to use the same path.
-fn session_cache_key(method: &str, resource_url: &str) -> Result<String, pay_core::Error> {
+fn session_cache_key(
+    payer: &str,
+    method: &str,
+    resource_url: &str,
+) -> Result<String, pay_core::Error> {
     let origin = pay_core::session::canonical_session_origin(resource_url)?;
     let url = reqwest::Url::parse(resource_url)
         .map_err(|error| pay_core::Error::Mpp(format!("invalid MPP session URL: {error}")))?;
-    Ok(format!("{method} {origin}{}", url.path()))
+    Ok(format!("{payer} {method} {origin}{}", url.path()))
+}
+
+/// The wallet a call pays from, partitioning reusable session credentials so
+/// one payer's authorization is never attached to another payer's request.
+fn session_payer(
+    store: &dyn pay_core::accounts::AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> String {
+    let network = network_override.unwrap_or(pay_core::accounts::MAINNET_NETWORK);
+    let Ok(accounts) = store.load() else {
+        return String::new();
+    };
+    let account = match account_override {
+        Some(name) => accounts.named_account_for_network(network, name),
+        None => accounts
+            .account_for_network(network)
+            .map(|(_, account)| account),
+    };
+    account
+        .and_then(|account| account.pubkey.clone())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -261,11 +287,7 @@ pub async fn run(
     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
     match response {
-        Ok((body, content_type)) => Ok(CallToolResult::success(body_to_mcp_content(
-            body,
-            content_type.as_deref(),
-            "Request completed.",
-        ))),
+        Ok(response) => Ok(response.into_tool_result()),
         Err(err) => Ok(pay_error_to_tool_result(err)),
     }
 }
@@ -886,10 +908,33 @@ fn sniff_media_mime(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Result of a paid fetch: raw response body bytes and the content-type the
-/// server advertised. Bytes (not String) so binary payloads — images, PDFs,
-/// octet streams — round-trip without UTF-8 mangling.
-type PaidFetchResult = (Vec<u8>, Option<String>);
+/// A completed fetch retains its execution status alongside the raw body and
+/// advertised content-type, including when the response follows a payment.
+struct PaidFetchResult {
+    exit_code: i32,
+    body: Vec<u8>,
+    content_type: Option<String>,
+}
+
+impl PaidFetchResult {
+    fn into_tool_result(self) -> CallToolResult {
+        let is_error = self.exit_code != 0;
+        let content = body_to_mcp_content(
+            self.body,
+            self.content_type.as_deref(),
+            if is_error {
+                "Request failed."
+            } else {
+                "Request completed."
+            },
+        );
+        if is_error {
+            CallToolResult::error(content)
+        } else {
+            CallToolResult::success(content)
+        }
+    }
+}
 
 fn hardware_address_matches(expected: Option<&str>, actual: &str) -> bool {
     expected.is_none_or(|expected| actual == expected)
@@ -1013,6 +1058,45 @@ fn prepare_hardware_account(
     }
 }
 
+fn authorize_batch_escrow(
+    scope: &crate::context::CallScope,
+    challenge: &pay_core::client::x402::BatchChallenge,
+    resource_url: &str,
+    escrow: u64,
+) -> Result<(), pay_core::Error> {
+    match &scope.payment_permissions {
+        Some(permissions) => permissions.authorize_batch_escrow(challenge, resource_url, escrow),
+        None => Ok(()),
+    }
+}
+
+/// Hosted payments settle only challenges issued by the origin the caller
+/// requested; the paid retry is sent to that origin.
+fn reject_cross_origin_challenge(
+    requested_url: &str,
+    outcome: &pay_core::client::runner::RunOutcome,
+) -> Result<(), pay_core::Error> {
+    use pay_core::client::runner::RunOutcome;
+
+    let resource_url = match outcome {
+        RunOutcome::MppChallenge { resource_url, .. }
+        | RunOutcome::SessionChallenge { resource_url, .. }
+        | RunOutcome::SubscriptionChallenge { resource_url, .. }
+        | RunOutcome::X402Challenge { resource_url, .. }
+        | RunOutcome::X402UptoChallenge { resource_url, .. }
+        | RunOutcome::X402BatchChallenge { resource_url, .. }
+        | RunOutcome::X402SignInChallenge { resource_url, .. } => resource_url,
+        _ => return Ok(()),
+    };
+    if pay_core::client::fetch::same_origin(requested_url, resource_url) {
+        return Ok(());
+    }
+    Err(pay_core::Error::RequestValidation(format!(
+        "The payment challenge came from {resource_url}, not the requested origin. \
+         Request that URL directly if you intend to pay it."
+    )))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn do_paid_fetch(
     method: &str,
@@ -1047,12 +1131,28 @@ fn do_paid_fetch(
         )
     };
 
-    // A fresh gate per signing operation, chosen by the caller's context:
-    // the platform prompt or the client's elicitation on a laptop, the
-    // tenant's spending policy in the cloud. `None` lets the account's own
-    // policy decide.
-    let make_auth_override =
-        || -> pay_core::signer::AuthOverride { scope.auth_override(peer.as_ref()) };
+    // A definitive answer to a paid retry ends the attempt; a transport or
+    // server error keeps its idempotency material for the caller's retry.
+    let attempt = pay_core::client::attempt::PaymentAttempt::new(
+        method,
+        url,
+        body.map(RequestBody::as_bytes),
+    );
+    let paid_fetch = |headers: &[(String, String)]| {
+        let outcome = fetch_request(headers)?;
+        if !matches!(
+            outcome,
+            RunOutcome::Completed { exit_code, .. } if exit_code != 0
+        ) {
+            attempt.resolved();
+        }
+        Ok::<_, pay_core::Error>(outcome)
+    };
+
+    // Every signing operation runs under `scope.with_approval`: a fresh gate
+    // chosen by the caller's context (the platform prompt or the client's
+    // elicitation on a laptop, the tenant's spending policy in the cloud),
+    // whose reservation is released unless a signature is produced.
 
     let store: &dyn pay_core::accounts::AccountsStore = scope.accounts.as_ref();
     let network_override = scope.network_override.clone();
@@ -1076,7 +1176,12 @@ fn do_paid_fetch(
         }
         _ => extra_headers.to_vec(),
     };
-    let session_key = session_cache_key(method, url).ok();
+    let payer = session_payer(
+        store,
+        network_override.as_deref(),
+        account_override.as_deref(),
+    );
+    let session_key = session_cache_key(&payer, method, url).ok();
     let cached_session = session_key.as_deref().and_then(|key| {
         (!initial_headers
             .iter()
@@ -1089,6 +1194,9 @@ fn do_paid_fetch(
     }
 
     let outcome = fetch_request(&initial_headers)?;
+    if scope.outbound_policy == pay_core::client::fetch::OutboundPolicy::PublicInternetOnly {
+        reject_cross_origin_challenge(url, &outcome)?;
+    }
     if let Some(payment_network) = outcome.payment_network(network_override.as_deref())? {
         account_override =
             prepare_hardware_account(store, &payment_network, account_override, peer.as_ref())?;
@@ -1139,29 +1247,33 @@ fn do_paid_fetch(
                     if let Some(permissions) = &scope.payment_permissions {
                         permissions.authorize_mpp(ch.as_ref(), &resource_url)?;
                     }
-                    let (auth_header, _ephemeral) =
+                    let (auth_header, _ephemeral) = scope.with_approval(peer.as_ref(), |auth| {
                         pay_core::client::mpp::build_credential_with_override(
                             ch.as_ref(),
                             store,
                             network_override.as_deref(),
                             account_override.as_deref(),
                             Some(url),
-                            make_auth_override(),
-                        )?;
+                            auth,
+                        )
+                    })?;
                     headers.push(("Authorization".to_string(), auth_header));
                 }
                 ChosenPayment::X402(challenge) => {
                     if let Some(permissions) = &scope.payment_permissions {
                         permissions.authorize_x402(challenge.as_ref(), &resource_url)?;
                     }
-                    let built_payment = pay_core::client::x402::build_payment_with_override(
-                        challenge.as_ref(),
-                        store,
-                        network_override.as_deref(),
-                        account_override.as_deref(),
-                        Some(url),
-                        make_auth_override(),
-                    )?;
+                    let built_payment = scope.with_approval(peer.as_ref(), |auth| {
+                        pay_core::client::x402::build_payment_for_attempt(
+                            challenge.as_ref(),
+                            store,
+                            network_override.as_deref(),
+                            account_override.as_deref(),
+                            Some(url),
+                            auth,
+                            Some(&attempt),
+                        )
+                    })?;
                     headers.extend(
                         built_payment
                             .headers
@@ -1173,14 +1285,17 @@ fn do_paid_fetch(
                     if let Some(permissions) = &scope.payment_permissions {
                         permissions.authorize_upto(challenge.as_ref(), &resource_url)?;
                     }
-                    let built_payment = pay_core::client::x402::build_upto_payment_with_override(
-                        challenge.as_ref(),
-                        store,
-                        network_override.as_deref(),
-                        account_override.as_deref(),
-                        Some(url),
-                        make_auth_override(),
-                    )?;
+                    let built_payment = scope.with_approval(peer.as_ref(), |auth| {
+                        pay_core::client::x402::build_upto_payment_for_attempt(
+                            challenge.as_ref(),
+                            store,
+                            network_override.as_deref(),
+                            account_override.as_deref(),
+                            Some(url),
+                            auth,
+                            &attempt,
+                        )
+                    })?;
                     headers.extend(
                         built_payment
                             .headers
@@ -1189,7 +1304,7 @@ fn do_paid_fetch(
                     );
                 }
             }
-            interpret_retry(fetch_request(&headers)?)
+            interpret_retry(paid_fetch(&headers)?)
         }
         RunOutcome::X402Challenge {
             challenge,
@@ -1199,14 +1314,17 @@ fn do_paid_fetch(
             if let Some(permissions) = &scope.payment_permissions {
                 permissions.authorize_x402(&challenge, &resource_url)?;
             }
-            let built_payment = pay_core::client::x402::build_payment_with_override(
-                &challenge,
-                store,
-                network_override.as_deref(),
-                account_override.as_deref(),
-                Some(url),
-                make_auth_override(),
-            )?;
+            let built_payment = scope.with_approval(peer.as_ref(), |auth| {
+                pay_core::client::x402::build_payment_for_attempt(
+                    &challenge,
+                    store,
+                    network_override.as_deref(),
+                    account_override.as_deref(),
+                    Some(url),
+                    auth,
+                    Some(&attempt),
+                )
+            })?;
             let mut headers = extra_headers.to_vec();
             headers.extend(
                 built_payment
@@ -1214,7 +1332,7 @@ fn do_paid_fetch(
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            interpret_retry(fetch_request(&headers)?)
+            interpret_retry(paid_fetch(&headers)?)
         }
         RunOutcome::X402UptoChallenge {
             challenge,
@@ -1224,14 +1342,17 @@ fn do_paid_fetch(
             if let Some(permissions) = &scope.payment_permissions {
                 permissions.authorize_upto(&challenge, &resource_url)?;
             }
-            let built_payment = pay_core::client::x402::build_upto_payment_with_override(
-                &challenge,
-                store,
-                network_override.as_deref(),
-                account_override.as_deref(),
-                Some(url),
-                make_auth_override(),
-            )?;
+            let built_payment = scope.with_approval(peer.as_ref(), |auth| {
+                pay_core::client::x402::build_upto_payment_for_attempt(
+                    &challenge,
+                    store,
+                    network_override.as_deref(),
+                    account_override.as_deref(),
+                    Some(url),
+                    auth,
+                    &attempt,
+                )
+            })?;
             let mut headers = extra_headers.to_vec();
             headers.extend(
                 built_payment
@@ -1239,7 +1360,7 @@ fn do_paid_fetch(
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            interpret_retry(fetch_request(&headers)?)
+            interpret_retry(paid_fetch(&headers)?)
         }
         RunOutcome::X402BatchChallenge {
             challenge,
@@ -1249,16 +1370,19 @@ fn do_paid_fetch(
             if let Some(permissions) = &scope.payment_permissions {
                 permissions.authorize_batch(&challenge, &resource_url)?;
             }
-            let built = pay_core::client::x402::build_batch_payment(
-                &challenge,
-                store,
-                &session_cache.batch_channels,
-                None,
-                network_override.as_deref(),
-                account_override.as_deref(),
-                Some(url),
-                make_auth_override(),
-            )?;
+            let built = scope.with_approval(peer.as_ref(), |auth| {
+                pay_core::client::x402::build_batch_payment_checked(
+                    &challenge,
+                    store,
+                    &session_cache.batch_channels,
+                    None,
+                    network_override.as_deref(),
+                    account_override.as_deref(),
+                    Some(url),
+                    auth,
+                    &|escrow| authorize_batch_escrow(scope, &challenge, &resource_url, escrow),
+                )
+            })?;
             let mut headers = extra_headers.to_vec();
             headers.extend(
                 built
@@ -1267,7 +1391,7 @@ fn do_paid_fetch(
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            let outcome = fetch_request(&headers)?;
+            let outcome = paid_fetch(&headers)?;
 
             // A corrective 402 means the server's watermark is ahead of ours
             // (a previous response was lost in flight). It proves where it is
@@ -1286,16 +1410,19 @@ fn do_paid_fetch(
                 if let Some(permissions) = &scope.payment_permissions {
                     permissions.authorize_batch(corrective, &resource_url)?;
                 }
-                let retry = pay_core::client::x402::build_batch_payment(
-                    corrective,
-                    store,
-                    &session_cache.batch_channels,
-                    None,
-                    network_override.as_deref(),
-                    account_override.as_deref(),
-                    Some(url),
-                    make_auth_override(),
-                )?;
+                let retry = scope.with_approval(peer.as_ref(), |auth| {
+                    pay_core::client::x402::build_batch_payment_checked(
+                        corrective,
+                        store,
+                        &session_cache.batch_channels,
+                        None,
+                        network_override.as_deref(),
+                        account_override.as_deref(),
+                        Some(url),
+                        auth,
+                        &|escrow| authorize_batch_escrow(scope, corrective, &resource_url, escrow),
+                    )
+                })?;
                 let mut headers = extra_headers.to_vec();
                 headers.extend(
                     retry
@@ -1304,7 +1431,7 @@ fn do_paid_fetch(
                         .into_iter()
                         .map(|(name, value)| (name.to_string(), value)),
                 );
-                let outcome = fetch_request(&headers)?;
+                let outcome = paid_fetch(&headers)?;
                 commit_batch_settlement(
                     session_cache,
                     &corrective.requirements,
@@ -1329,44 +1456,56 @@ fn do_paid_fetch(
             ..
         } => {
             // Prefer spending existing credits: sign in with the wallet and
-            // retry. The sign-in signature takes one Touch ID / approval; if
-            // sign-in doesn't grant access and we fall back to paying below,
-            // the payment signature requires a second approval.
-            let built = pay_core::client::x402::build_siwx_auth_header_with_override(
-                &challenge,
-                store,
-                network_override.as_deref(),
-                account_override.as_deref(),
-                Some(url),
-                make_auth_override(),
-            )?;
-            let mut headers = extra_headers.to_vec();
-            headers.extend(
-                built
-                    .headers
-                    .into_iter()
-                    .map(|(name, value)| (name.to_string(), value)),
-            );
-            let retry = fetch_request(&headers)?;
+            // retry. The sign-in signature takes its own approval (hosted
+            // callers need a client prompt for it); if sign-in is refused or
+            // doesn't grant access and we fall back to paying below, the
+            // payment signature requires a second approval.
+            let signed_in = scope.with_approval(peer.as_ref(), |auth| {
+                pay_core::client::x402::build_siwx_auth_header_with_override(
+                    &challenge,
+                    store,
+                    network_override.as_deref(),
+                    account_override.as_deref(),
+                    Some(url),
+                    auth,
+                )
+            });
+            let retry = match signed_in {
+                Ok(built) => {
+                    let mut headers = extra_headers.to_vec();
+                    headers.extend(
+                        built
+                            .headers
+                            .into_iter()
+                            .map(|(name, value)| (name.to_string(), value)),
+                    );
+                    Some(paid_fetch(&headers)?)
+                }
+                Err(error) if payment_fallback.is_none() => return Err(error),
+                Err(_) => None,
+            };
 
             // If sign-in granted access, we're done — credits were spent, no
             // payment made. If the server still refuses (e.g. the wallet has
             // no credits yet) and the same 402 also offered a payment option,
             // fall back to paying so the call can still go through.
-            if matches!(retry, RunOutcome::Completed { .. }) {
+            if let Some(retry @ RunOutcome::Completed { .. }) = retry {
                 interpret_retry(retry)
             } else if let Some(pay_challenge) = payment_fallback {
                 if let Some(permissions) = &scope.payment_permissions {
                     permissions.authorize_x402(&pay_challenge, &resource_url)?;
                 }
-                let built_payment = pay_core::client::x402::build_payment_with_override(
-                    &pay_challenge,
-                    store,
-                    network_override.as_deref(),
-                    account_override.as_deref(),
-                    Some(url),
-                    make_auth_override(),
-                )?;
+                let built_payment = scope.with_approval(peer.as_ref(), |auth| {
+                    pay_core::client::x402::build_payment_for_attempt(
+                        &pay_challenge,
+                        store,
+                        network_override.as_deref(),
+                        account_override.as_deref(),
+                        Some(url),
+                        auth,
+                        Some(&attempt),
+                    )
+                })?;
                 let mut headers = extra_headers.to_vec();
                 headers.extend(
                     built_payment
@@ -1374,8 +1513,8 @@ fn do_paid_fetch(
                         .into_iter()
                         .map(|(name, value)| (name.to_string(), value)),
                 );
-                interpret_retry(fetch_request(&headers)?)
-            } else if let RunOutcome::PaymentRejected { reason, .. } = retry {
+                interpret_retry(paid_fetch(&headers)?)
+            } else if let Some(RunOutcome::PaymentRejected { reason, .. }) = retry {
                 Err(pay_core::Error::PaymentRejected(reason))
             } else {
                 // Sign-in didn't grant access and the 402 offered no payment
@@ -1388,9 +1527,13 @@ fn do_paid_fetch(
                 ))
             }
         }
-        RunOutcome::SessionChallenge { challenge, .. } => {
+        RunOutcome::SessionChallenge {
+            challenge,
+            resource_url,
+            ..
+        } => {
             if let Some(permissions) = &scope.payment_permissions {
-                permissions.reject_unsupported("MPP session payments")?;
+                permissions.authorize_session(&challenge, &resource_url)?;
             }
             let key = session_key.ok_or_else(|| {
                 pay_core::Error::Mpp(
@@ -1398,17 +1541,19 @@ fn do_paid_fetch(
                 )
             })?;
             let (open_authorization, use_authorization) =
-                pay_core::session::open_operator_signed_session_authorizations(
-                    &challenge,
-                    store,
-                    network_override.as_deref(),
-                    account_override.as_deref(),
-                    url,
-                    make_auth_override(),
-                )?;
+                scope.with_approval(peer.as_ref(), |auth| {
+                    pay_core::session::open_operator_signed_session_authorizations(
+                        &challenge,
+                        store,
+                        network_override.as_deref(),
+                        account_override.as_deref(),
+                        url,
+                        auth,
+                    )
+                })?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), open_authorization));
-            let retry = fetch_request(&headers)?;
+            let retry = paid_fetch(&headers)?;
             if matches!(&retry, RunOutcome::Completed { .. }) {
                 // Only retain a session after the gateway accepted its open
                 // request; otherwise the channel may not exist remotely.
@@ -1435,7 +1580,7 @@ fn do_paid_fetch(
             // `authenticate` challenge in the 402, we sign it with the
             // same unlocked signer and cache the resulting token so
             // subsequent requests in the period skip the prompt.
-            let built =
+            let built = scope.with_approval(peer.as_ref(), |auth| {
                 pay_core::client::subscription::build_credential_with_authenticate_and_override(
                     &challenge,
                     authenticate.as_deref(),
@@ -1443,11 +1588,12 @@ fn do_paid_fetch(
                     network_override.as_deref(),
                     account_override.as_deref(),
                     Some(url),
-                    make_auth_override(),
-                )?;
+                    auth,
+                )
+            })?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), built.authorization.clone()));
-            let retry = fetch_request(&headers)?;
+            let retry = paid_fetch(&headers)?;
             if let RunOutcome::Completed { exit_code, .. } = &retry
                 && *exit_code == 0
                 && let Err(e) =
@@ -1467,8 +1613,15 @@ fn do_paid_fetch(
             "402 Payment Required but no recognized protocol".to_string(),
         )),
         RunOutcome::Completed {
-            body, content_type, ..
-        } => Ok((body.unwrap_or_default(), content_type)),
+            exit_code,
+            body,
+            content_type,
+            ..
+        } => Ok(PaidFetchResult {
+            exit_code,
+            body: body.unwrap_or_default(),
+            content_type,
+        }),
     }
 }
 
@@ -1576,8 +1729,15 @@ fn interpret_retry(
     use pay_core::client::runner::RunOutcome;
     match outcome {
         RunOutcome::Completed {
-            body, content_type, ..
-        } => Ok((body.unwrap_or_default(), content_type)),
+            exit_code,
+            body,
+            content_type,
+            ..
+        } => Ok(PaidFetchResult {
+            exit_code,
+            body: body.unwrap_or_default(),
+            content_type,
+        }),
         RunOutcome::PaymentRejected { reason, .. } => Err(pay_core::Error::PaymentRejected(reason)),
         _ => Err(pay_core::Error::Mpp(
             "Server returned 402 again after payment".to_string(),
@@ -1587,7 +1747,127 @@ fn interpret_retry(
 
 #[cfg(test)]
 mod tests {
+
+    fn x402_outcome(resource_url: &str) -> pay_core::client::runner::RunOutcome {
+        let requirements: pay_kit::x402::exact::PaymentRequirements =
+            serde_json::from_value(serde_json::json!({
+                "network": "mainnet",
+                "recipient": "11111111111111111111111111111111",
+                "amount": "1000",
+                "currency": "USDC",
+                "decimals": 6,
+                "resource": resource_url,
+            }))
+            .unwrap();
+        pay_core::client::runner::RunOutcome::X402Challenge {
+            challenge: Box::new(pay_core::client::x402::Challenge {
+                x402_version: 2,
+                requirements,
+                siwx: None,
+                extensions: None,
+            }),
+            advertised_challenges: Default::default(),
+            resource_url: resource_url.to_string(),
+        }
+    }
+
+    #[test]
+    fn hosted_payment_rejects_challenge_from_redirected_origin() {
+        let err = reject_cross_origin_challenge(
+            "https://api.example/start",
+            &x402_outcome("https://attacker.example/paid"),
+        )
+        .expect_err("cross-origin challenge must not be paid");
+        assert!(err.to_string().contains("attacker.example"), "{err}");
+    }
+
+    #[test]
+    fn hosted_payment_accepts_challenge_from_requested_origin() {
+        reject_cross_origin_challenge(
+            "https://api.example/start",
+            &x402_outcome("https://api.example/paid?x=1"),
+        )
+        .expect("same-origin challenge");
+        reject_cross_origin_challenge(
+            "https://api.example/start",
+            &pay_core::client::runner::RunOutcome::Completed {
+                exit_code: 0,
+                body: None,
+                content_type: None,
+                response_headers: vec![],
+            },
+        )
+        .expect("non-payment outcomes pass through");
+    }
     use super::*;
+
+    #[test]
+    fn interpret_retry_preserves_exit_code_and_response() {
+        use pay_core::client::runner::RunOutcome;
+
+        // Model the completed response to a request retried with payment proof.
+        // The fetch layer maps HTTP 502 to exit_code=1, just as for 400/429.
+        for exit_code in [0, 1, 22] {
+            for body in [None, Some(Vec::new()), Some(b"Bad Gateway".to_vec())] {
+                let content_type = Some("text/plain; charset=utf-8".to_string());
+                let response = interpret_retry(RunOutcome::Completed {
+                    exit_code,
+                    body: body.clone(),
+                    content_type: content_type.clone(),
+                    response_headers: Vec::new(),
+                })
+                .expect("a completed HTTP failure is not a payment/protocol error");
+                assert_eq!(response.exit_code, exit_code);
+                assert_eq!(response.body, body.unwrap_or_default());
+                assert_eq!(response.content_type, content_type);
+
+                let expected_text = if response.body.is_empty() {
+                    if exit_code == 0 {
+                        "Request completed."
+                    } else {
+                        "Request failed."
+                    }
+                } else {
+                    "Bad Gateway"
+                };
+                let result = response.into_tool_result();
+                assert_eq!(result.is_error, Some(exit_code != 0));
+                assert_eq!(result.content[0].as_text().unwrap().text, expected_text);
+            }
+        }
+    }
+
+    #[test]
+    fn interpret_retry_preserves_binary_http_failure() {
+        let body = b"\x89PNG\r\n\x1a\n\xff".to_vec();
+        let response = interpret_retry(pay_core::client::runner::RunOutcome::Completed {
+            exit_code: 1,
+            body: Some(body.clone()),
+            content_type: Some("image/png".to_string()),
+            response_headers: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(response.body, body);
+        assert_eq!(response.content_type.as_deref(), Some("image/png"));
+        let result = response.into_tool_result();
+        assert_eq!(result.is_error, Some(true));
+        let image = result.content[0].as_image().unwrap();
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(general_purpose::STANDARD.decode(&image.data).unwrap(), body);
+    }
+
+    #[test]
+    fn interpret_retry_still_rejects_repeated_402() {
+        let outcome = pay_core::client::runner::classify_402(
+            &[],
+            Some("Payment Required"),
+            "https://example.com/paid",
+        );
+        let Err(pay_core::Error::Mpp(message)) = interpret_retry(outcome) else {
+            panic!("a repeated 402 must remain a payment error");
+        };
+        assert_eq!(message, "Server returned 402 again after payment");
+    }
 
     #[test]
     fn hardware_account_connection_must_match_saved_address() {
@@ -1888,13 +2168,59 @@ mod tests {
     }
 
     #[test]
+    fn session_cache_key_isolated_by_payer() {
+        let alpha = session_cache_key("alpha", "POST", "https://api.example.com/v1").unwrap();
+        let beta = session_cache_key("beta", "POST", "https://api.example.com/v1").unwrap();
+        assert_ne!(alpha, beta);
+
+        let cache = SessionCache::default();
+        cache.store(alpha.clone(), "Payment alpha".to_string());
+        assert_eq!(cache.authorization(&beta), None);
+        assert_eq!(
+            cache.authorization(&alpha).as_deref(),
+            Some("Payment alpha")
+        );
+    }
+
+    #[test]
+    fn session_payer_is_the_selected_account_pubkey() {
+        let mut file = pay_core::accounts::AccountsFile::default();
+        for (name, pubkey) in [("a", "PubkeyA"), ("b", "PubkeyB")] {
+            file.upsert(
+                "mainnet",
+                name,
+                pay_core::accounts::Account {
+                    backend: pay_core::accounts::BackendKind::Ephemeral,
+                    provider: None,
+                    active: name == "a",
+                    auth_required: Some(false),
+                    pubkey: Some(pubkey.to_string()),
+                    vault: None,
+                    account: None,
+                    path: None,
+                    secret_key_b58: None,
+                    created_at: None,
+                    subscriptions: Default::default(),
+                },
+            );
+        }
+        let store = pay_core::accounts::MemoryAccountsStore::with_file(file);
+        assert_eq!(session_payer(&store, Some("mainnet"), Some("b")), "PubkeyB");
+        assert_eq!(session_payer(&store, None, None), "PubkeyA");
+        assert_eq!(session_payer(&store, Some("devnet"), None), "");
+    }
+
+    #[test]
     fn session_cache_key_isolated_by_method_and_endpoint() {
-        let first = session_cache_key("POST", "https://api.example.com/v1/models?model=a").unwrap();
+        let first = session_cache_key("payer", "POST", "https://api.example.com/v1/models?model=a")
+            .unwrap();
         let same_endpoint =
-            session_cache_key("POST", "https://api.example.com/v1/models?model=b").unwrap();
+            session_cache_key("payer", "POST", "https://api.example.com/v1/models?model=b")
+                .unwrap();
         let other_endpoint =
-            session_cache_key("POST", "https://api.example.com/v1/images").unwrap();
-        let other_method = session_cache_key("GET", "https://api.example.com/v1/models").unwrap();
+            session_cache_key("payer", "POST", "https://api.example.com/v1/images").unwrap();
+        let other_method =
+            session_cache_key("payer", "GET", "https://api.example.com/v1/models").unwrap();
 
         assert_eq!(first, same_endpoint);
         assert_ne!(first, other_endpoint);

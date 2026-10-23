@@ -1,23 +1,25 @@
 //! Channel decoding, distribution-preimage recovery, and instruction building
 //! for the payment-channels program.
 //!
-//! Reuses pay-kit's Codama-generated [`Channel`] account (borsh-decoded via
-//! `Channel::from_bytes`) and its instruction builders, plus pay-api-core's
-//! ATA derivation and RPC client.
+//! Bound sessions use pay-kit's ownership-aware, versioned decoder. Existing
+//! fleet jobs remain V1-only and reject V2 rather than decoding its V1 prefix.
+//! ATA derivation and RPC access come from pay-api-core.
 
 use std::str::FromStr;
 
 use pay_api_core::ata::{SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, associated_token_address};
 use pay_api_core::rpc::RpcClient;
 use pay_kit::core::payment_channels::{default_program_id, find_event_authority_pda, to_address};
+use pay_kit::core::payment_channels_v2::Deployment;
 use pay_kit::generated::payment_channels::generated::accounts::Channel;
 use pay_kit::generated::payment_channels::generated::instructions::{
-    DistributeBuilder, OPEN_DISCRIMINATOR, ReclaimBuilder, RequestCloseBuilder, SealBuilder,
-    SettleAndSealBuilder, TopUpBuilder, WithdrawPayerBuilder,
+    DistributeBuilder, ReclaimBuilder, RequestCloseBuilder, SealBuilder, SettleAndSealBuilder,
+    TopUpBuilder, WithdrawPayerBuilder,
 };
 use pay_kit::generated::payment_channels::generated::types::{
     DistributeArgs, DistributionEntry, SettleAndSealArgs, TopUpArgs,
 };
+use pay_kit::mpp::server::session::SessionConfig;
 use sha2::{Digest, Sha256};
 use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
@@ -38,15 +40,24 @@ pub const STATUS_DISTRIBUTED: u8 = 3;
 /// Fixed serialized size of the current epoch-addressed Channel account.
 pub const CHANNEL_ACCOUNT_SIZE: usize = 256;
 
-/// Byte length of the on-chain `open` instruction header that precedes the
-/// distribution `recipients` vector: `disc(1) + salt(8) + deposit(8) +
-/// grace_period(4) + open_slot(8)`.
-const OPEN_HEADER_LEN: usize = 29;
+/// Accounts `distribute` names before its recipient-ATA tail.
+const DISTRIBUTE_FIXED_ACCOUNTS: usize = 11;
 
-/// A distribution must fit in a Solana transaction together with the fixed
-/// channel accounts. Keep malformed preimages from requesting an unbounded
-/// allocation and reject plans that cannot be represented safely.
-const MAX_DISTRIBUTION_RECIPIENTS: usize = 64;
+/// Keys the payer refund-account create adds beyond `distribute`'s own: the
+/// associated-token and system programs.
+const REFUND_ACCOUNT_CREATE_KEYS: usize = 2;
+
+/// The most recipients whose distribution still fits one transaction on its
+/// own: a version-1 message's static keys hold the fixed `distribute`
+/// accounts, the refund-account create, a distinct fee payer and one ATA per
+/// recipient. A larger plan cannot be paid out by this worker, so recovery
+/// reports it instead of retrying a transaction that can never be built.
+pub const MAX_DISTRIBUTION_RECIPIENTS: usize = pay_kit::core::tx::TxVersion::V1
+    .limits()
+    .max_static_accounts
+    - DISTRIBUTE_FIXED_ACCOUNTS
+    - REFUND_ACCOUNT_CREATE_KEYS
+    - 1;
 
 /// Chain discovery cannot prove a channel was never deployment-bound. Only
 /// an extant legacy row permits the fleet reclamation path.
@@ -179,7 +190,7 @@ pub async fn fetch_channel(
         .flatten())
 }
 
-/// Fetch a channel using its immutable session program, not the fleet default.
+/// Fetch a V1 channel using an explicit program. V2 requires `fetch_session_channel`.
 pub async fn fetch_channel_for_program(
     rpc: &RpcClient,
     rpc_url: &str,
@@ -195,12 +206,161 @@ pub async fn fetch_channel_for_program(
     if account.owner != program_id.to_string() {
         return Err(JobError::Config("session channel program mismatch".into()));
     }
-    Ok(Channel::from_bytes(&account.data)
+    decode_v1_channel(address, &account.data)
+}
+
+/// Account discriminator of the program's terminal `ClosedChannel` tombstone.
+const CLOSED_CHANNEL_DISCRIMINATOR: u8 = 2;
+
+/// Whether `address` is provably gone, not merely missing from one read.
+///
+/// A confirmed read can lag or return a stale null for a live channel, and
+/// dropping its durable record would reopen settled vouchers. Absence counts
+/// only at finalized commitment from a node past the slot after which the
+/// channel can no longer be opened (`open_slot + OPEN_SLOT_WINDOW`), or when
+/// the program has left its closed-channel tombstone.
+pub async fn channel_absence_proven(
+    rpc: &RpcClient,
+    rpc_url: &str,
+    address: &Pubkey,
+    program_id: &Pubkey,
+    open_slot: u64,
+) -> Result<bool, JobError> {
+    let (slot, accounts) = rpc
+        .get_multiple_accounts_with_owner_at(
+            rpc_url,
+            &[address.to_string()],
+            pay_api_core::rpc::Commitment::Finalized,
+        )
+        .await?;
+    Ok(match accounts.into_iter().next().flatten() {
+        None => slot > open_slot.saturating_add(pay_kit::core::payment_channels::OPEN_SLOT_WINDOW),
+        Some(account) => {
+            account.owner == program_id.to_string()
+                && account.data.len() < CHANNEL_ACCOUNT_SIZE
+                && account.data.first() == Some(&CLOSED_CHANNEL_DISCRIMINATOR)
+        }
+    })
+}
+
+/// Whether `address` reads as distributed at finalized commitment: a channel
+/// account in `Distributed` status, or the program's closed tombstone. A
+/// confirmed distribution can still be dropped by a fork, so durable records
+/// are only finished on this proof.
+pub async fn finalized_distributed(
+    rpc: &RpcClient,
+    rpc_url: &str,
+    address: &Pubkey,
+    program_id: &Pubkey,
+) -> Result<bool, JobError> {
+    let (_, accounts) = rpc
+        .get_multiple_accounts_with_owner_at(
+            rpc_url,
+            &[address.to_string()],
+            pay_api_core::rpc::Commitment::Finalized,
+        )
+        .await?;
+    let Some(account) = accounts.into_iter().next().flatten() else {
+        return Ok(false);
+    };
+    if account.owner != program_id.to_string() {
+        return Err(JobError::Config(format!(
+            "channel {address} is owned by {}, not its program",
+            account.owner
+        )));
+    }
+    Ok(match account.data.first() {
+        Some(1) => account.data.get(3) == Some(&STATUS_DISTRIBUTED),
+        Some(&CLOSED_CHANNEL_DISCRIMINATOR) => account.data.len() < CHANNEL_ACCOUNT_SIZE,
+        _ => false,
+    })
+}
+
+/// Validate persisted ABI selection before any recovery or transaction building.
+pub fn session_deployment(config: &SessionConfig) -> Result<Deployment, JobError> {
+    config
+        .channel_deployment()
+        .map_err(|error| JobError::Config(format!("session deployment: {error}")))
+}
+
+/// Ownership and immutable hook configuration must both match the snapshot.
+pub fn decode_session_channel(
+    address: &Pubkey,
+    owner: &Pubkey,
+    data: &[u8],
+    config: &SessionConfig,
+) -> Result<DecodedChannel, JobError> {
+    let decoded = session_deployment(config)?
+        .decode_account(owner, data)
+        .map_err(|error| JobError::Config(format!("session channel: {error}")))?;
+    if decoded.hooks != config.channel_hooks.clone().unwrap_or_default() {
+        return Err(JobError::Config(
+            "session channel hooks differ from snapshot".into(),
+        ));
+    }
+    Ok(DecodedChannel {
+        address: *address,
+        channel: decoded.channel,
+    })
+}
+
+pub async fn fetch_session_channel(
+    rpc: &RpcClient,
+    rpc_url: &str,
+    address: &Pubkey,
+    config: &SessionConfig,
+) -> Result<Option<DecodedChannel>, JobError> {
+    let deployment = session_deployment(config)?;
+    if deployment.version == 1 {
+        // Preserve V1 tombstone handling, but still reject a V2 prefix.
+        return fetch_channel_for_program(rpc, rpc_url, address, &deployment.program_id).await;
+    }
+    let accounts = rpc
+        .get_multiple_accounts_with_owner(rpc_url, &[address.to_string()])
+        .await?;
+    let Some(account) = accounts.into_iter().next().flatten() else {
+        return Ok(None);
+    };
+    let owner =
+        Pubkey::from_str(&account.owner).map_err(|_| JobError::InvalidAddress(account.owner))?;
+    decode_session_channel(address, &owner, &account.data, config).map(Some)
+}
+
+fn decode_v1_channel(address: &Pubkey, data: &[u8]) -> Result<Option<DecodedChannel>, JobError> {
+    // Codama's V1 decoder accepts a V2 prefix. Never infer V1 from that success.
+    if data.get(1) == Some(&2)
+        || data.len() == pay_kit::core::payment_channels_v2::CHANNEL_ACCOUNT_SIZE
+    {
+        return Err(JobError::Config(
+            "V2 channel requires a persisted session deployment and hooks; V1 recovery is unsupported".into(),
+        ));
+    }
+    Ok(Channel::from_bytes(data)
         .ok()
         .map(|channel| DecodedChannel {
             address: *address,
             channel,
         }))
+}
+
+fn decode_v1_account(
+    address: &Pubkey,
+    owner: &str,
+    data: &[u8],
+) -> Result<Option<DecodedChannel>, JobError> {
+    if owner == pay_kit::core::payment_channels_v2::PAYMENT_CHANNELS_PROGRAM_ID {
+        return Err(JobError::Config(
+            "V2 channel is unsupported by the V1/batch worker path".into(),
+        ));
+    }
+    // A live account owned by another program is not an absent channel: a
+    // record for it belongs to a deployment this worker cannot judge.
+    if owner != default_program_id().to_string() {
+        return Err(JobError::Config(format!(
+            "channel {address} is owned by {owner}, not the worker's payment-channels program"
+        )));
+    }
+    decode_v1_channel(address, data)
 }
 
 /// Fetch and decode up to 100 channels with one `getMultipleAccounts` call.
@@ -212,13 +372,25 @@ pub async fn fetch_channels(
     rpc_url: &str,
     addresses: &[Pubkey],
 ) -> Result<Vec<Option<DecodedChannel>>, JobError> {
+    fetch_channels_each(rpc, rpc_url, addresses)
+        .await?
+        .into_iter()
+        .collect()
+}
+
+/// [`fetch_channels`] with one decode result per address, so one foreign or
+/// unsupported account fails only its own channel.
+pub async fn fetch_channels_each(
+    rpc: &RpcClient,
+    rpc_url: &str,
+    addresses: &[Pubkey],
+) -> Result<Vec<Result<Option<DecodedChannel>, JobError>>, JobError> {
     if addresses.len() > 100 {
         return Err(JobError::TxBuild(format!(
             "channel account batch has {} addresses; maximum is 100",
             addresses.len()
         )));
     }
-    let program_id = default_program_id();
     let accounts = rpc
         .get_multiple_accounts_with_owner(
             rpc_url,
@@ -228,17 +400,20 @@ pub async fn fetch_channels(
                 .collect::<Vec<_>>(),
         )
         .await?;
+    if accounts.len() != addresses.len() {
+        return Err(JobError::Rpc(pay_api_core::Error::RpcMalformed));
+    }
     Ok(addresses
         .iter()
         .copied()
         .zip(accounts)
         .map(|(address, account)| {
-            let account = account.filter(|account| account.owner == program_id.to_string())?;
+            let Some(account) = account else {
+                return Ok(None);
+            };
             // Tombstoned / closed channels are a different (short) account
             // shape; a decode failure means this is not a live channel.
-            Channel::from_bytes(&account.data)
-                .ok()
-                .map(|channel| DecodedChannel { address, channel })
+            decode_v1_account(&address, &account.owner, &account.data)
         })
         .collect())
 }
@@ -278,10 +453,9 @@ pub fn distribution_preimage_from_snapshot(
 /// transaction.
 ///
 /// The on-chain `distribution_hash` is `sha256(count || entries)`; only the
-/// hash is stored, so we walk `getSignaturesForAddress` back to the OLDEST
-/// signature (the open), decode the `open` instruction data, and slice off the
-/// 21-byte header to recover `count || entries`. We verify
-/// `sha256(preimage) == channel.distribution_hash` before returning.
+/// hash is stored, so we find the channel's `open` in its address history and
+/// re-encode its recipients. We verify `sha256(preimage) ==
+/// channel.distribution_hash` before returning.
 ///
 /// This works for every channel, including the empty-plan case (count = 0,
 /// preimage = `00 00 00 00`).
@@ -290,6 +464,11 @@ pub async fn recover_distribution_preimage(
     rpc_url: &str,
     channel: &DecodedChannel,
 ) -> Result<DistributionPreimage, JobError> {
+    if channel.channel.version != 1 {
+        return Err(JobError::Config(
+            "native distribution recovery is V1-only; V2 requires its persisted snapshot".into(),
+        ));
+    }
     // Empty distribution plans are by far the common case and their preimage
     // is canonical. Avoid two historical RPC reads per channel when the hash
     // itself proves that this is the correct preimage.
@@ -300,20 +479,7 @@ pub async fn recover_distribution_preimage(
             recipients: Vec::new(),
         });
     }
-    let open_sig = find_open_signature(rpc, rpc_url, &channel.address).await?;
-    let tx_b64 = rpc
-        .get_transaction_base64(rpc_url, &open_sig)
-        .await?
-        .ok_or(JobError::OpenTxNotFound)?;
-    let ix_data = extract_open_ix_data(&tx_b64)?;
-
-    if ix_data.len() < OPEN_HEADER_LEN {
-        return Err(JobError::OpenIxDecode(format!(
-            "open instruction data too short: {} bytes",
-            ix_data.len()
-        )));
-    }
-    let preimage_bytes = ix_data[OPEN_HEADER_LEN..].to_vec();
+    let preimage_bytes = find_open_preimage(rpc, rpc_url, channel).await?;
 
     // Verify against the on-chain hash before trusting the preimage.
     let computed = Sha256::digest(&preimage_bytes);
@@ -328,69 +494,92 @@ pub async fn recover_distribution_preimage(
     })
 }
 
-/// Walk `getSignaturesForAddress` (newest-first, paginated) to the oldest
-/// signature that touched the channel — that's the `open`.
-async fn find_open_signature(
+/// Find the channel's `open` and return its `count || entries` payload.
+///
+/// Anyone can mention the channel PDA in a transaction before it exists, so
+/// the oldest mention is not necessarily the open. Walk the address history
+/// (newest-first, paginated) and examine successful transactions that landed
+/// in the slots an open for this channel can land in, oldest first, accepting
+/// only one whose instruction is this channel's open. The open-slot window
+/// bounds the scan.
+async fn find_open_preimage(
     rpc: &RpcClient,
     rpc_url: &str,
-    channel: &Pubkey,
-) -> Result<String, JobError> {
+    channel: &DecodedChannel,
+) -> Result<Vec<u8>, JobError> {
     const PAGE: u32 = 1000;
-    let addr = channel.to_string();
+    let program_id = default_program_id();
+    let addr = channel.address.to_string();
+    let first_slot = channel.open_slot();
+    let last_slot = first_slot.saturating_add(pay_kit::core::payment_channels::OPEN_SLOT_WINDOW);
     let mut before: Option<String> = None;
-    let mut oldest: Option<String> = None;
+    let mut candidates = Vec::new();
     loop {
         let page = rpc
-            .get_signatures_for_address(rpc_url, &addr, before.as_deref(), PAGE)
+            .get_signature_infos_for_address(rpc_url, &addr, before.as_deref(), PAGE)
             .await?;
-        if page.is_empty() {
+        let Some(last) = page.last() else {
+            break;
+        };
+        before = Some(last.signature.clone());
+        let short = (page.len() as u32) < PAGE;
+        let past_window = last.slot < first_slot;
+        candidates.extend(
+            page.into_iter()
+                .filter(|info| !info.failed && (first_slot..=last_slot).contains(&info.slot)),
+        );
+        if short || past_window {
             break;
         }
-        // Signatures come back newest-first; the last of each page is its
-        // oldest. Keep paginating with `before = last` until a short page.
-        let last = page.last().cloned();
-        oldest = last.clone();
-        if (page.len() as u32) < PAGE {
-            break;
-        }
-        before = last;
     }
-    oldest.ok_or(JobError::OpenTxNotFound)
+    // Pages are newest-first; the open precedes every other use of the channel.
+    for info in candidates.iter().rev() {
+        let Some(tx_b64) = rpc.get_transaction_base64(rpc_url, &info.signature).await? else {
+            continue;
+        };
+        if let Some(preimage) = open_preimage_in(&tx_b64, &channel.address, &program_id)? {
+            return Ok(preimage);
+        }
+    }
+    Err(JobError::OpenTxNotFound)
 }
 
-/// Decode a base64 wire transaction and return the data bytes of the
-/// instruction whose program id is the payment-channels program and whose
-/// discriminator (`data[0]`) is `OPEN_DISCRIMINATOR` (1).
+/// The `count || entries` payload of `channel`'s open in a base64 wire
+/// transaction, or `None` when the transaction is not that open.
 ///
-/// Decodes as a `VersionedTransaction` so it handles both legacy and v0
-/// (versioned) transactions — the relayer opens channels via v0 txs, which a
-/// legacy `Transaction` decode rejects. An invoked program id is always a
-/// static account key (never address-lookup-loaded), so the compiled
-/// `program_id_index` resolves against the message's static account keys for
-/// both message versions.
-fn extract_open_ix_data(tx_b64: &str) -> Result<Vec<u8>, JobError> {
+/// Decodes as a `VersionedTransaction`, so legacy, v0 and v1 messages are all
+/// handled; the kit never uses lookup tables, so every account an instruction
+/// names is a static key.
+fn open_preimage_in(
+    tx_b64: &str,
+    channel: &Pubkey,
+    program_id: &Pubkey,
+) -> Result<Option<Vec<u8>>, JobError> {
     use base64::Engine;
     let raw = base64::engine::general_purpose::STANDARD
         .decode(tx_b64.trim())
         .map_err(|e| JobError::OpenIxDecode(format!("base64 decode: {e}")))?;
-    let tx: solana_transaction::versioned::VersionedTransaction = wincode::deserialize(&raw)
-        .map_err(|e| JobError::OpenIxDecode(format!("transaction decode: {e}")))?;
-    let program_id = default_program_id();
-    // Versions 0 and 1 both keep every account an instruction names in the
-    // static keys (the kit never uses lookup tables).
-    let keys = tx.message.static_account_keys();
-    let instructions = tx.message.instructions();
-    for ix in instructions {
-        let Some(program) = keys.get(ix.program_id_index as usize) else {
-            continue;
-        };
-        if *program == program_id && ix.data.first().copied() == Some(OPEN_DISCRIMINATOR) {
-            return Ok(ix.data.clone());
-        }
+    let Ok(tx) = wincode::deserialize::<solana_transaction::versioned::VersionedTransaction>(&raw)
+    else {
+        return Ok(None);
+    };
+    let Some(args) =
+        pay_kit::core::payment_channels::decode_open_for_channel(&tx.message, channel, program_id)
+    else {
+        return Ok(None);
+    };
+    if args.recipients.len() > MAX_DISTRIBUTION_RECIPIENTS {
+        return Err(JobError::OpenIxDecode(format!(
+            "distribution has {} recipients; maximum is {MAX_DISTRIBUTION_RECIPIENTS}",
+            args.recipients.len()
+        )));
     }
-    Err(JobError::OpenIxDecode(
-        "no open instruction found in the channel's creation transaction".into(),
-    ))
+    let mut preimage = (args.recipients.len() as u32).to_le_bytes().to_vec();
+    for entry in &args.recipients {
+        preimage.extend_from_slice(entry.recipient.as_ref());
+        preimage.extend_from_slice(&entry.bps.to_le_bytes());
+    }
+    Ok(Some(preimage))
 }
 
 /// Decode `count(u32 LE) || entries(count × 34)` into `DistributionEntry`s.
@@ -529,6 +718,56 @@ pub fn build_top_up_ix(
         .instruction()
 }
 
+/// Idempotently create the payer's refund token account. `distribute` writes
+/// the refund there, and the payer can close an emptied account at any time;
+/// without it the distribution, and every channel co-batched with it, fails.
+pub fn payer_refund_account_ix(
+    fee_payer: &Pubkey,
+    channel: &DecodedChannel,
+    token_program: &Pubkey,
+) -> Instruction {
+    pay_kit::core::payment_channels::build_create_associated_token_account_instruction(
+        fee_payer,
+        &channel.payer(),
+        &channel.mint(),
+        token_program,
+    )
+}
+
+/// When `instructions` (a close followed by the payer refund-account create
+/// and `distribute`) cannot be built as one `version` transaction, drop the
+/// distribution so the close lands alone; the next pass reads the sealed
+/// channel and distributes it by itself. Returns whether it split.
+pub fn defer_oversized_distribution(
+    instructions: &mut Vec<Instruction>,
+    fee_payer: &Pubkey,
+    version: pay_kit::core::tx::TxVersion,
+) -> bool {
+    use pay_kit::generated::payment_channels::generated::instructions::DISTRIBUTE_DISCRIMINATOR;
+    let ata_program = to_address(&pay_api_core::ata::ATA_PROGRAM_ID);
+    let Some(split) = instructions.windows(2).position(|pair| {
+        pair[0].program_id == ata_program
+            && pair[0].data == [1]
+            && pair[1].data.first() == Some(&DISTRIBUTE_DISCRIMINATOR)
+    }) else {
+        return false;
+    };
+    if split == 0
+        || pay_kit::core::tx::build_unsigned(
+            version,
+            fee_payer,
+            instructions,
+            solana_hash::Hash::default(),
+            None,
+        )
+        .is_ok()
+    {
+        return false;
+    }
+    instructions.truncate(split);
+    true
+}
+
 /// Accounts derived for a `distribute` instruction, surfaced for logging.
 pub struct DistributeAccounts {
     pub channel_ata: Pubkey,
@@ -626,6 +865,428 @@ pub fn build_distribute_ix_for_program(
 mod tests {
     use super::*;
 
+    fn v2_fixture() -> (SessionConfig, Vec<u8>) {
+        use pay_kit::core::payment_channels_v2::{ChannelHooks, HookDescriptor};
+        let hooks = ChannelHooks {
+            post_distribute: Some(HookDescriptor {
+                program_id: Pubkey::new_unique().to_string(),
+                entrypoint: *b"refund!!",
+                accounts: vec![],
+                static_data: vec![7],
+            }),
+            ..Default::default()
+        };
+        let config = SessionConfig {
+            network: "devnet".into(),
+            channel_program: Some(
+                pay_kit::core::payment_channels_v2::PAYMENT_CHANNELS_PROGRAM_ID
+                    .parse()
+                    .unwrap(),
+            ),
+            channel_version: Some(2),
+            channel_hooks: Some(hooks.clone()),
+            ..Default::default()
+        };
+        let mut bytes = vec![0; pay_kit::core::payment_channels_v2::CHANNEL_ACCOUNT_SIZE];
+        bytes[0] = 1;
+        bytes[1] = 2;
+        bytes[265..297].copy_from_slice(&hooks.config_hash().unwrap());
+        bytes[297..].copy_from_slice(&hooks.encode_fixed().unwrap());
+        (config, bytes)
+    }
+
+    #[test]
+    fn session_decoder_checks_owner_abi_and_persisted_hooks() {
+        let (config, bytes) = v2_fixture();
+        let address = Pubkey::new_unique();
+        let owner = config.channel_program.unwrap();
+        assert_eq!(
+            decode_session_channel(&address, &owner, &bytes, &config)
+                .unwrap()
+                .channel
+                .version,
+            2
+        );
+        assert!(decode_session_channel(&address, &default_program_id(), &bytes, &config).is_err());
+        let mut missing_hooks = config.clone();
+        missing_hooks.channel_hooks = None;
+        assert!(decode_session_channel(&address, &owner, &bytes, &missing_hooks).is_err());
+        let mut mismatch = config.clone();
+        mismatch
+            .channel_hooks
+            .as_mut()
+            .unwrap()
+            .post_distribute
+            .as_mut()
+            .unwrap()
+            .static_data
+            .push(8);
+        assert!(decode_session_channel(&address, &owner, &bytes, &mismatch).is_err());
+        let mut missing_version = config;
+        missing_version.channel_version = None;
+        assert!(decode_session_channel(&address, &owner, &bytes, &missing_version).is_err());
+        assert!(decode_v1_channel(&address, &bytes).is_err());
+        // Batch/fleet reconciliation must report unsupported rather than
+        // treating a V2-owned account as absent and deleting its durable row.
+        assert!(decode_v1_account(&address, &owner.to_string(), &bytes).is_err());
+        assert!(decode_v1_account(&address, &owner.to_string(), &[0]).is_err());
+    }
+
+    #[test]
+    fn unhooked_v2_requires_matching_explicit_deployment_not_some_empty_hooks() {
+        let (mut config, mut bytes) = v2_fixture();
+        config.channel_hooks = None;
+        let empty = pay_kit::core::payment_channels_v2::ChannelHooks::default();
+        bytes[265..297].copy_from_slice(&empty.config_hash().unwrap());
+        bytes[297..].copy_from_slice(&empty.encode_fixed().unwrap());
+        assert!(
+            decode_session_channel(
+                &Pubkey::new_unique(),
+                &config.channel_program.unwrap(),
+                &bytes,
+                &config
+            )
+            .is_ok()
+        );
+        config.channel_program = None;
+        assert!(session_deployment(&config).is_err());
+    }
+
+    #[tokio::test]
+    async fn v1_recovery_refuses_v2_before_rpc_even_for_empty_plan() {
+        let (config, bytes) = v2_fixture();
+        let mut channel = decode_session_channel(
+            &Pubkey::new_unique(),
+            &config.channel_program.unwrap(),
+            &bytes,
+            &config,
+        )
+        .unwrap();
+        channel.channel.distribution_hash = Sha256::digest([0; 4]).into();
+        let rpc = RpcClient::new(std::time::Duration::from_millis(10)).unwrap();
+        assert!(matches!(
+            recover_distribution_preimage(&rpc, "http://127.0.0.1:1", &channel).await,
+            Err(JobError::Config(_))
+        ));
+        channel.channel.version = 1;
+        assert!(
+            recover_distribution_preimage(&rpc, "http://127.0.0.1:1", &channel)
+                .await
+                .unwrap()
+                .recipients
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn default_session_keeps_v1_account_layout() {
+        let mut bytes = vec![0; CHANNEL_ACCOUNT_SIZE];
+        bytes[0] = 1;
+        bytes[1] = 1;
+        let address = Pubkey::new_unique();
+        assert_eq!(
+            session_deployment(&SessionConfig::default()).unwrap(),
+            Deployment::default()
+        );
+        assert!(
+            decode_session_channel(
+                &address,
+                &default_program_id(),
+                &bytes,
+                &SessionConfig::default()
+            )
+            .is_ok()
+        );
+        assert!(decode_v1_channel(&address, &bytes).unwrap().is_some());
+        assert!(decode_v1_channel(&address, &[0]).unwrap().is_none());
+    }
+
+    async fn serve_account(
+        slot: u64,
+        account: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Json, Router, routing::post};
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let account = account.clone();
+                async move {
+                    assert_eq!(request["method"], "getMultipleAccounts");
+                    assert_eq!(request["params"][1]["commitment"], "finalized");
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1,
+                        "result": {"context": {"slot": slot}, "value": [account]}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        (
+            url,
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+        )
+    }
+
+    #[tokio::test]
+    async fn only_a_finalized_distributed_read_finishes_a_close() {
+        use base64::Engine;
+        let rpc = RpcClient::new(std::time::Duration::from_secs(5)).unwrap();
+        let address = Pubkey::new_unique();
+        let program = default_program_id();
+        let account = |status: u8| {
+            let mut data = vec![0; CHANNEL_ACCOUNT_SIZE];
+            data[0] = 1;
+            data[1] = 1;
+            data[3] = status;
+            serde_json::json!({
+                "owner": program.to_string(),
+                "data": [base64::engine::general_purpose::STANDARD.encode(data), "base64"]
+            })
+        };
+        for (value, expected) in [
+            (account(STATUS_DISTRIBUTED), true),
+            // A close rolled back by a fork reads open or closing again.
+            (account(STATUS_OPEN), false),
+            (account(STATUS_CLOSING), false),
+            (account(STATUS_SEALED), false),
+            (serde_json::Value::Null, false),
+        ] {
+            let (url, server) = serve_account(1, value).await;
+            let distributed = finalized_distributed(&rpc, &url, &address, &program)
+                .await
+                .unwrap();
+            server.abort();
+            assert_eq!(distributed, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn absence_requires_finalized_proof_past_the_open_window() {
+        use base64::Engine;
+        let rpc = RpcClient::new(std::time::Duration::from_secs(5)).unwrap();
+        let address = Pubkey::new_unique();
+        let program = default_program_id();
+        let open_slot = 10_000;
+        let window = pay_kit::core::payment_channels::OPEN_SLOT_WINDOW;
+        let encoded = |data: &[u8]| base64::engine::general_purpose::STANDARD.encode(data);
+        let mut live = vec![0; CHANNEL_ACCOUNT_SIZE];
+        live[0] = 1;
+        live[1] = 1;
+        let cases = [
+            (open_slot + window, serde_json::Value::Null, false),
+            (open_slot + window + 1, serde_json::Value::Null, true),
+            (
+                0,
+                serde_json::json!({"owner": program.to_string(), "data": [encoded(&[2]), "base64"]}),
+                true,
+            ),
+            (
+                u64::MAX,
+                serde_json::json!({"owner": Pubkey::new_unique().to_string(), "data": [encoded(&[2]), "base64"]}),
+                false,
+            ),
+            (
+                u64::MAX,
+                serde_json::json!({"owner": program.to_string(), "data": [encoded(&live), "base64"]}),
+                false,
+            ),
+        ];
+        for (slot, account, expected) in cases {
+            let (url, server) = serve_account(slot, account.clone()).await;
+            let proven = channel_absence_proven(&rpc, &url, &address, &program, open_slot)
+                .await
+                .unwrap();
+            server.abort();
+            assert_eq!(proven, expected, "slot {slot} account {account}");
+        }
+    }
+
+    #[test]
+    fn payer_refund_account_is_recreated_idempotently_at_the_distribute_slot() {
+        let mut bytes = vec![0; CHANNEL_ACCOUNT_SIZE];
+        bytes[0] = 1;
+        bytes[1] = 1;
+        let mut channel = decode_v1_channel(&Pubkey::new_unique(), &bytes)
+            .unwrap()
+            .unwrap();
+        channel.channel.payer = to_address(&Pubkey::new_unique());
+        channel.channel.mint = to_address(&Pubkey::new_unique());
+        let fee_payer = Pubkey::new_unique();
+        for token_program in [SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID] {
+            let create = payer_refund_account_ix(&fee_payer, &channel, &token_program);
+            let (distribute, accounts) = build_distribute_ix(
+                &channel,
+                &Pubkey::new_unique(),
+                &token_program,
+                &DistributionPreimage {
+                    preimage_bytes: vec![0; 4],
+                    recipients: vec![],
+                },
+            );
+            // CreateIdempotent, funded by the fee payer, for the exact refund account.
+            assert_eq!(create.data, vec![1]);
+            assert_eq!(
+                create.program_id,
+                to_address(&pay_api_core::ata::ATA_PROGRAM_ID)
+            );
+            assert_eq!(create.accounts[0].pubkey, to_address(&fee_payer));
+            assert!(create.accounts[0].is_signer);
+            assert_eq!(create.accounts[1].pubkey, to_address(&accounts.payer_ata));
+            assert_eq!(distribute.accounts[4].pubkey, create.accounts[1].pubkey);
+            assert_eq!(create.accounts[2].pubkey, channel.channel.payer);
+            assert_eq!(create.accounts[5].pubkey, to_address(&token_program));
+        }
+    }
+
+    #[test]
+    fn a_foreign_owned_account_is_never_reported_absent() {
+        let mut bytes = vec![0; CHANNEL_ACCOUNT_SIZE];
+        bytes[0] = 1;
+        bytes[1] = 1;
+        let address = Pubkey::new_unique();
+        let custom = Pubkey::new_unique().to_string();
+        assert!(decode_v1_account(&address, &custom, &bytes).is_err());
+        assert!(decode_v1_account(&address, &custom, &[2]).is_err());
+        let canonical = default_program_id().to_string();
+        assert!(
+            decode_v1_account(&address, &canonical, &bytes)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            decode_v1_account(&address, &canonical, &[2])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn recipients_channel(count: usize) -> (DecodedChannel, DistributionPreimage) {
+        let mut bytes = vec![0; CHANNEL_ACCOUNT_SIZE];
+        bytes[0] = 1;
+        bytes[1] = 1;
+        let mut channel = decode_v1_channel(&Pubkey::new_unique(), &bytes)
+            .unwrap()
+            .unwrap();
+        channel.channel.status = STATUS_CLOSING;
+        for key in [
+            &mut channel.channel.payer,
+            &mut channel.channel.payee,
+            &mut channel.channel.rent_payer,
+            &mut channel.channel.mint,
+            &mut channel.channel.authorized_signer,
+        ] {
+            *key = to_address(&Pubkey::new_unique());
+        }
+        let recipients = (0..count)
+            .map(|_| pay_kit::core::payment_channels::Distribution {
+                recipient: Pubkey::new_unique(),
+                bps: 1,
+            })
+            .collect::<Vec<_>>();
+        channel.channel.distribution_hash =
+            pay_kit::core::payment_channels::distribution_hash(&recipients);
+        let preimage =
+            distribution_preimage_from_snapshot(&recipients, &channel.channel.distribution_hash)
+                .unwrap();
+        (channel, preimage)
+    }
+
+    fn payout(
+        channel: &DecodedChannel,
+        preimage: &DistributionPreimage,
+        fee_payer: &Pubkey,
+    ) -> Vec<Instruction> {
+        vec![
+            payer_refund_account_ix(fee_payer, channel, &SPL_TOKEN_PROGRAM_ID),
+            build_distribute_ix(
+                channel,
+                &Pubkey::new_unique(),
+                &SPL_TOKEN_PROGRAM_ID,
+                preimage,
+            )
+            .0,
+        ]
+    }
+
+    #[test]
+    fn the_largest_accepted_plan_distributes_in_one_transaction() {
+        use pay_kit::core::tx::{TxVersion, build_unsigned};
+        // A fee payer distinct from every channel account is the worst case.
+        let fee_payer = Pubkey::new_unique();
+        let (channel, preimage) = recipients_channel(MAX_DISTRIBUTION_RECIPIENTS);
+        build_unsigned(
+            TxVersion::V1,
+            &fee_payer,
+            &payout(&channel, &preimage, &fee_payer),
+            solana_hash::Hash::default(),
+            None,
+        )
+        .expect("the maximum plan must fit");
+
+        // One more recipient no longer fits, and is refused at recovery
+        // rather than retried forever.
+        let recipients = (0..=MAX_DISTRIBUTION_RECIPIENTS)
+            .map(|_| pay_kit::core::payment_channels::Distribution {
+                recipient: Pubkey::new_unique(),
+                bps: 1,
+            })
+            .collect::<Vec<_>>();
+        let hash = pay_kit::core::payment_channels::distribution_hash(&recipients);
+        assert!(distribution_preimage_from_snapshot(&recipients, &hash).is_err());
+        let mut preimage = (recipients.len() as u32).to_le_bytes().to_vec();
+        for entry in &recipients {
+            preimage.extend_from_slice(entry.recipient.as_ref());
+            preimage.extend_from_slice(&entry.bps.to_le_bytes());
+        }
+        assert!(decode_recipients(&preimage).is_err());
+    }
+
+    #[test]
+    fn a_close_that_cannot_carry_its_distribution_lands_alone() {
+        use pay_kit::core::tx::TxVersion;
+        let fee_payer = Pubkey::new_unique();
+        let (channel, preimage) = recipients_channel(MAX_DISTRIBUTION_RECIPIENTS);
+        // Settling the final voucher adds the payee, the instructions sysvar
+        // and the signature-verify program to the distribution's keys.
+        let close = pay_kit::core::payment_channels::build_settle_and_seal_instructions(
+            &channel.payee(),
+            &channel.address,
+            &Pubkey::from(channel.channel.authorized_signer.to_bytes()),
+            Some(&[3; 64]),
+            10,
+            0,
+            &default_program_id(),
+        )
+        .unwrap();
+        let mut combined = close.clone();
+        combined.extend(payout(&channel, &preimage, &fee_payer));
+        assert!(defer_oversized_distribution(
+            &mut combined,
+            &fee_payer,
+            TxVersion::V1
+        ));
+        assert_eq!(combined, close);
+
+        // A distribution alone is never split, and a fitting pair is kept.
+        let mut alone = payout(&channel, &preimage, &fee_payer);
+        assert!(!defer_oversized_distribution(
+            &mut alone,
+            &fee_payer,
+            TxVersion::V1
+        ));
+        assert_eq!(alone.len(), 2);
+        let (small, small_preimage) = recipients_channel(2);
+        let mut fitting = vec![build_seal_ix(&small.address)];
+        fitting.extend(payout(&small, &small_preimage, &fee_payer));
+        assert!(!defer_oversized_distribution(
+            &mut fitting,
+            &fee_payer,
+            TxVersion::V0
+        ));
+        assert_eq!(fitting.len(), 3);
+    }
+
     #[test]
     fn empty_plan_preimage_hashes_to_zero_count() {
         // count = 0 → preimage = the 4 bytes 00 00 00 00.
@@ -667,39 +1328,183 @@ mod tests {
         assert!(decode_recipients(&u32::MAX.to_le_bytes()).is_err());
     }
 
-    #[test]
-    fn extract_open_ix_data_rejects_garbage() {
-        assert!(extract_open_ix_data("not base64!!!").is_err());
+    fn wire_transaction(fee_payer: &Pubkey, instructions: &[Instruction]) -> String {
+        use base64::Engine;
+        let message = solana_message::legacy::Message::new(instructions, Some(fee_payer));
+        let transaction = solana_transaction::versioned::VersionedTransaction {
+            signatures: vec![
+                solana_signature::Signature::default();
+                usize::from(message.header.num_required_signatures)
+            ],
+            message: solana_message::VersionedMessage::Legacy(message),
+        };
+        base64::engine::general_purpose::STANDARD.encode(wincode::serialize(&transaction).unwrap())
+    }
+
+    /// Serve an address history and its transactions: `(signature, slot,
+    /// failed, base64 transaction)`, newest first.
+    async fn serve_history(
+        history: Vec<(String, u64, bool, String)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Json, Router, routing::post};
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let history = history.clone();
+                async move {
+                    let result = match request["method"].as_str().unwrap() {
+                        "getSignaturesForAddress" => serde_json::Value::Array(
+                            history
+                                .iter()
+                                .map(|(signature, slot, failed, _)| {
+                                    serde_json::json!({
+                                        "signature": signature,
+                                        "slot": slot,
+                                        "err": if *failed { serde_json::json!({"x": 1}) } else { serde_json::Value::Null },
+                                    })
+                                })
+                                .collect(),
+                        ),
+                        "getTransaction" => {
+                            let wanted = request["params"][0].as_str().unwrap();
+                            history
+                                .iter()
+                                .find(|(signature, ..)| signature == wanted)
+                                .map(|(.., tx)| serde_json::json!({"transaction": [tx, "base64"]}))
+                                .unwrap_or(serde_json::Value::Null)
+                        }
+                        other => panic!("unexpected {other}"),
+                    };
+                    Json(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        (
+            url,
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+        )
+    }
+
+    #[tokio::test]
+    async fn recovery_skips_pre_open_mentions_and_finds_the_real_open() {
+        use pay_kit::core::payment_channels::{
+            Distribution, OpenChannelParams, build_open_instruction, derive_channel_addresses,
+            distribution_hash,
+        };
+        let recipients = vec![Distribution {
+            recipient: Pubkey::new_unique(),
+            bps: 10_000,
+        }];
+        let params = OpenChannelParams {
+            payer: Pubkey::new_unique(),
+            rent_payer: Pubkey::new_unique(),
+            payee: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+            authorized_signer: Pubkey::new_unique(),
+            salt: 9,
+            open_slot: 5_000,
+            deposit: 1_000,
+            grace_period: 900,
+            recipients: recipients.clone(),
+            token_program: SPL_TOKEN_PROGRAM_ID,
+            program_id: default_program_id(),
+        };
+        let address = derive_channel_addresses(&params).channel;
+        let mut bytes = vec![0; CHANNEL_ACCOUNT_SIZE];
+        bytes[0] = 1;
+        bytes[1] = 1;
+        let mut channel = decode_v1_channel(&address, &bytes).unwrap().unwrap();
+        channel.channel.open_slot = params.open_slot;
+        channel.channel.distribution_hash = distribution_hash(&recipients);
+
+        // A readonly mention of the future PDA, and an open-shaped spoof whose
+        // accounts do not derive this channel.
+        let marker = Instruction {
+            program_id: to_address(&Pubkey::new_unique()),
+            accounts: vec![solana_instruction::AccountMeta::new_readonly(
+                to_address(&address),
+                false,
+            )],
+            data: vec![],
+        };
+        let mut spoof = build_open_instruction(&OpenChannelParams {
+            salt: 10,
+            ..params.clone()
+        });
+        spoof.accounts[5].pubkey = to_address(&address);
+        let open = build_open_instruction(&params);
+        let payer = params.payer;
+        let tx = |instructions: &[Instruction]| wire_transaction(&payer, instructions);
+        let rpc = RpcClient::new(std::time::Duration::from_secs(5)).unwrap();
+
+        let history = vec![
+            (
+                "settle".to_string(),
+                5_900,
+                false,
+                tx(std::slice::from_ref(&marker)),
+            ),
+            (
+                "open".to_string(),
+                5_100,
+                false,
+                tx(std::slice::from_ref(&open)),
+            ),
+            (
+                "failed-open".to_string(),
+                5_050,
+                true,
+                tx(std::slice::from_ref(&open)),
+            ),
+            ("spoof".to_string(), 5_020, false, tx(&[spoof])),
+            (
+                "marker".to_string(),
+                5_010,
+                false,
+                tx(std::slice::from_ref(&marker)),
+            ),
+            (
+                "before-window".to_string(),
+                4_000,
+                false,
+                tx(std::slice::from_ref(&marker)),
+            ),
+        ];
+        let (url, server) = serve_history(history.clone()).await;
+        let preimage = recover_distribution_preimage(&rpc, &url, &channel)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(preimage.recipients.len(), 1);
+        assert_eq!(
+            preimage.recipients[0].recipient.to_bytes(),
+            recipients[0].recipient.to_bytes()
+        );
+
+        // Mentions alone are never an open: exhausted history is not found.
+        let without_open = history
+            .into_iter()
+            .filter(|(signature, ..)| !signature.ends_with("open"))
+            .collect();
+        let (url, server) = serve_history(without_open).await;
+        let error = recover_distribution_preimage(&rpc, &url, &channel)
+            .await
+            .err()
+            .unwrap();
+        server.abort();
+        assert!(matches!(error, JobError::OpenTxNotFound), "{error}");
     }
 
     #[test]
-    fn extract_open_ix_data_accepts_legacy_transactions() {
-        use base64::Engine;
-        use solana_hash::Hash;
-        use solana_message::{
-            MessageHeader, VersionedMessage, compiled_instruction::CompiledInstruction,
-        };
-        use solana_signature::Signature;
-        use solana_transaction::versioned::VersionedTransaction;
-
-        let expected = vec![OPEN_DISCRIMINATOR, 7, 8, 9];
-        let message = solana_message::legacy::Message {
-            header: MessageHeader::default(),
-            account_keys: vec![default_program_id()],
-            recent_blockhash: Hash::default(),
-            instructions: vec![CompiledInstruction {
-                program_id_index: 0,
-                accounts: Vec::new(),
-                data: expected.clone(),
-            }],
-        };
-        let transaction = VersionedTransaction {
-            signatures: vec![Signature::default()],
-            message: VersionedMessage::Legacy(message),
-        };
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode(wincode::serialize(&transaction).expect("serialize legacy transaction"));
-
-        assert_eq!(extract_open_ix_data(&encoded).unwrap(), expected);
+    fn non_transactions_are_not_opens() {
+        let channel = Pubkey::new_unique();
+        assert!(open_preimage_in("not base64!!!", &channel, &default_program_id()).is_err());
+        assert!(
+            open_preimage_in("AAAA", &channel, &default_program_id())
+                .unwrap()
+                .is_none()
+        );
     }
 }
