@@ -2015,9 +2015,12 @@ async fn start_x402_server(
         network: "localnet".to_string(),
         rpc_url: Some("http://localhost:8899".to_string()),
         challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+        realm: Some("test-realm".to_string()),
+        store: Some(Arc::new(pay_kit::mpp::store::MemoryStore::new())),
         ..Default::default()
     })
     .ok();
+    assert!(mpp.is_some(), "MPP test config must build");
     let x402 = pay_kit::x402::server::X402::new(pay_kit::x402::server::Config {
         recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
         currencies: vec![pay_kit::x402::server::CurrencyConfig {
