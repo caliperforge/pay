@@ -2,7 +2,9 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
+use pay_core::client::balance::mainnet_rpc_url;
 use pay_core::client::fetch::RawResponse;
 use pay_core::client::mpp::{self, Challenge};
 use pay_core::skills::build::parse_frontmatter;
@@ -15,8 +17,12 @@ use pay_core::skills::probe::{
 use pay_kit::mpp::ChargeRequest;
 use pay_kit::x402::exact::{SOLANA_DEVNET, SOLANA_MAINNET};
 use pay_types::registry::ProviderFrontmatter;
-use serde_json::Value as Json;
+use serde_json::{Value as Json, json};
 use serde_yml::Value;
+use solana_pubkey::Pubkey;
+
+const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 const FORMAT_BOUNDS: [(&str, usize, usize); 3] = [
     ("summary", 24, 63),
@@ -36,7 +42,7 @@ pub struct NextCommand {
 
 impl NextCommand {
     pub fn run(self) -> pay_core::Result<()> {
-        match next_brief(&self.path, self.before.as_deref(), &Live)? {
+        match next_brief(&self.path, self.before.as_deref(), &Live, &LiveRpc)? {
             Some(brief) => print!("{brief}"),
             None => println!("green"),
         }
@@ -65,8 +71,38 @@ impl fmt::Display for Brief {
     }
 }
 
-/// Network slug and asked USD of one Solana offer.
-type SolanaOffer = (String, Option<f64>);
+trait Rpc {
+    /// The JSON-RPC `result` of `method`.
+    fn call(&self, method: &str, params: Json) -> pay_core::Result<Json>;
+}
+
+struct LiveRpc;
+
+impl Rpc for LiveRpc {
+    fn call(&self, method: &str, params: Json) -> pay_core::Result<Json> {
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        let headers = [("content-type".to_string(), "application/json".to_string())];
+        let raw = Live.fetch(
+            "POST",
+            &mainnet_rpc_url(),
+            &headers,
+            Some(&request.to_string()),
+        )?;
+        let mut body: Json = serde_json::from_slice(&raw.body)
+            .map_err(|e| pay_core::Error::Config(format!("{method}: {e}")))?;
+        if let Some(error) = body.get("error") {
+            return Err(pay_core::Error::Config(format!("{method}: {error}")));
+        }
+        Ok(body["result"].take())
+    }
+}
+
+struct SolanaOffer {
+    network: String,
+    asked: Option<f64>,
+    pay_to: Option<String>,
+    asset: String,
+}
 
 struct Offer {
     current: String,
@@ -79,6 +115,7 @@ fn next_brief(
     path: &Path,
     before: Option<&Path>,
     transport: &dyn Transport,
+    rpc: &dyn Rpc,
 ) -> pay_core::Result<Option<Brief>> {
     let yaml = read_frontmatter(path)?;
     let value: Value = serde_yml::from_str(&yaml)
@@ -103,7 +140,7 @@ fn next_brief(
             }));
         }
     }
-    probe_brief(&spec.meta.service_url, &endpoints, transport)
+    probe_brief(&spec.meta.service_url, &endpoints, transport, rpc)
 }
 
 fn format_brief(yaml: &Value) -> Option<Brief> {
@@ -124,6 +161,7 @@ fn probe_brief(
     service_url: &str,
     endpoints: &[ResolvedEndpoint],
     transport: &dyn Transport,
+    rpc: &dyn Rpc,
 ) -> pay_core::Result<Option<Brief>> {
     let parsed = url_host(service_url);
     let Some(host) = parsed.clone().filter(|h| transport.resolves(h)) else {
@@ -165,10 +203,14 @@ fn probe_brief(
             }
         }
     }
-    Ok(offers
+    let brief = offers
         .iter()
         .find_map(network_brief)
-        .or_else(|| offers.iter().find_map(price_brief)))
+        .or_else(|| offers.iter().find_map(price_brief));
+    match brief {
+        Some(brief) => Ok(Some(brief)),
+        None => payee_brief(&offers, rpc),
+    }
 }
 
 fn read_offer(
@@ -228,17 +270,28 @@ fn x402_offer(accept: &Json) -> Option<SolanaOffer> {
         SOLANA_DEVNET | "solana-devnet" | "devnet" => "devnet",
         _ => return None,
     };
+    let asset = accept["asset"].as_str().unwrap_or("");
     let asked = accept["amount"]
         .as_str()
         .or(accept["maxAmountRequired"].as_str())
-        .and_then(|amount| usd(amount, accept["asset"].as_str().unwrap_or("")));
-    Some((network.to_string(), asked))
+        .and_then(|amount| usd(amount, asset));
+    Some(SolanaOffer {
+        network: network.to_string(),
+        asked,
+        pay_to: accept["payTo"].as_str().map(str::to_string),
+        asset: asset.to_string(),
+    })
 }
 
 fn mpp_offer(challenge: &Challenge) -> Option<SolanaOffer> {
     let request: Option<ChargeRequest> = challenge.request.decode().ok();
-    let asked = request.and_then(|r| usd(&r.amount, &r.currency));
-    Some((mpp::challenge_network(challenge, None).ok()?, asked))
+    let asked = request.as_ref().and_then(|r| usd(&r.amount, &r.currency));
+    Some(SolanaOffer {
+        network: mpp::challenge_network(challenge, None).ok()?,
+        asked,
+        pay_to: None,
+        asset: request.map(|r| r.currency).unwrap_or_default(),
+    })
 }
 
 fn usd(amount: &str, asset: &str) -> Option<f64> {
@@ -246,7 +299,7 @@ fn usd(amount: &str, asset: &str) -> Option<f64> {
 }
 
 fn network_brief(offer: &Offer) -> Option<Brief> {
-    let on = |net: &str| offer.solana.iter().any(|(n, _)| n == net);
+    let on = |net: &str| offer.solana.iter().any(|o| o.network == net);
     let rule = match (on("mainnet"), on("devnet")) {
         (false, true) => "devnet only",
         (false, false) => "no Solana mainnet offer",
@@ -267,8 +320,8 @@ fn price_brief(offer: &Offer) -> Option<Brief> {
     let mut asked: Vec<f64> = offer
         .solana
         .iter()
-        .filter(|(n, _)| n == "mainnet")
-        .filter_map(|(_, usd)| *usd)
+        .filter(|o| o.network == "mainnet")
+        .filter_map(|o| o.asked)
         .collect();
     asked.sort_by(f64::total_cmp);
     asked.dedup();
@@ -306,6 +359,96 @@ fn price_brief(offer: &Offer) -> Option<Brief> {
         replacement,
         stop,
     })
+}
+
+fn payee_brief(offers: &[Offer], rpc: &dyn Rpc) -> pay_core::Result<Option<Brief>> {
+    let pairs = first_seen(
+        offers
+            .iter()
+            .flat_map(|o| &o.solana)
+            .filter(|o| o.network == "mainnet")
+            .filter_map(|o| Some((o.pay_to.as_deref()?, o.asset.as_str()))),
+    );
+    let payees = first_seen(pairs.iter().map(|&(pay_to, _)| pay_to));
+    if payees.len() > 1 {
+        return Ok(Some(payee(
+            format!("{} different recipients", payees.len()),
+            &payees.join(", "),
+            "one payTo across offers".into(),
+        )));
+    }
+    for (pay_to, asset) in pairs {
+        if let Some(brief) = pair_brief(pay_to, asset, rpc)? {
+            return Ok(Some(brief));
+        }
+    }
+    Ok(None)
+}
+
+fn pair_brief(pay_to: &str, asset: &str, rpc: &dyn Rpc) -> pay_core::Result<Option<Brief>> {
+    if Pubkey::from_str(pay_to).is_err() {
+        return Ok(Some(payee(
+            "payTo is not a Solana address".into(),
+            pay_to,
+            "a Solana wallet address".into(),
+        )));
+    }
+    if Pubkey::from_str(asset).is_err() {
+        return Ok(Some(payee(
+            "asset is not a Solana address".into(),
+            asset,
+            "a Solana mint address".into(),
+        )));
+    }
+    let account = rpc.call(
+        "getAccountInfo",
+        json!([pay_to, {"encoding": "jsonParsed"}]),
+    )?;
+    if account["value"]["owner"]
+        .as_str()
+        .is_some_and(|owner| [TOKEN_PROGRAM, TOKEN_2022_PROGRAM].contains(&owner))
+    {
+        return Ok(Some(payee(
+            "payTo is a token account, not a wallet".into(),
+            pay_to,
+            "the wallet that owns this token account".into(),
+        )));
+    }
+    let held = rpc.call(
+        "getTokenAccountsByOwner",
+        json!([pay_to, {"mint": asset}, {"encoding": "jsonParsed"}]),
+    )?;
+    let held = held["value"].as_array().ok_or_else(|| {
+        pay_core::Error::Config(format!("getTokenAccountsByOwner {pay_to}: no value array"))
+    })?;
+    let coin = normalize_currency(asset);
+    Ok(held.is_empty().then(|| {
+        payee(
+            format!("recipient has no {coin} token account"),
+            pay_to,
+            format!("a wallet holding a {coin} token account"),
+        )
+    }))
+}
+
+fn payee(rule: String, current: &str, replacement: String) -> Brief {
+    Brief {
+        check: "payee",
+        rule,
+        current: current.to_string(),
+        replacement,
+        stop: true,
+    }
+}
+
+fn first_seen<T: PartialEq>(items: impl IntoIterator<Item = T>) -> Vec<T> {
+    let mut seen = Vec::new();
+    for item in items {
+        if !seen.contains(&item) {
+            seen.push(item);
+        }
+    }
+    seen
 }
 
 /// Python's `format(n, "g")`.
@@ -360,12 +503,12 @@ fn endpoint_pairs(endpoints: &[ResolvedEndpoint]) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
 
     use base64::Engine;
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
     use pay_core::skills::probe::Recorded;
-    use serde_json::json;
 
     use super::*;
 
@@ -374,6 +517,43 @@ mod tests {
     const URL: &str = "https://paid.example.com/paid";
     const USDC: &str = pay_types::stablecoin_mints::USDC_MAINNET;
     const STOP: &str = "stop: the cause is on the seller's server\n";
+    const PAY_TO: &str = "11111111111111111111111111111111";
+
+    /// Results keyed by (method, `params[0]`), and the number of calls made.
+    struct RecordedRpc(HashMap<(String, String), Json>, Cell<usize>);
+
+    impl Rpc for RecordedRpc {
+        fn call(&self, method: &str, params: Json) -> pay_core::Result<Json> {
+            self.1.set(self.1.get() + 1);
+            let key = (
+                method.to_string(),
+                params[0].as_str().unwrap_or("").to_string(),
+            );
+            self.0.get(&key).cloned().ok_or_else(|| {
+                pay_core::Error::Config(format!("no recorded result for {method} {}", key.1))
+            })
+        }
+    }
+
+    fn rpc(account: Json, held: Json) -> RecordedRpc {
+        RecordedRpc(
+            HashMap::from([
+                (
+                    ("getAccountInfo".into(), PAY_TO.into()),
+                    json!({"value": account}),
+                ),
+                (
+                    ("getTokenAccountsByOwner".into(), PAY_TO.into()),
+                    json!({"value": held}),
+                ),
+            ]),
+            Cell::new(0),
+        )
+    }
+
+    fn funded() -> RecordedRpc {
+        rpc(Json::Null, json!([{"pubkey": USDC}]))
+    }
 
     fn listing(
         summary: &str,
@@ -405,15 +585,23 @@ mod tests {
         path
     }
 
+    fn answer(path: &Path, transport: &dyn Transport, rpc: &dyn Rpc) -> Option<String> {
+        next_brief(path, None, transport, rpc)
+            .unwrap()
+            .map(|b| b.to_string())
+    }
+
     fn brief(path: &Path, before: Option<&Path>, transport: &dyn Transport) -> String {
-        next_brief(path, before, transport)
+        next_brief(path, before, transport, &funded())
             .unwrap()
             .unwrap()
             .to_string()
     }
 
     fn is_green(path: &Path, before: Option<&Path>, transport: &dyn Transport) -> bool {
-        next_brief(path, before, transport).unwrap().is_none()
+        next_brief(path, before, transport, &funded())
+            .unwrap()
+            .is_none()
     }
 
     fn recorded(status: u16, headers: &[(&str, String)], body: &str) -> Recorded {
@@ -434,7 +622,7 @@ mod tests {
     }
 
     fn accept(network: &str, amount: &str) -> Json {
-        json!({"scheme": "exact", "network": network, "amount": amount, "asset": USDC, "payTo": "Payee"})
+        json!({"scheme": "exact", "network": network, "amount": amount, "asset": USDC, "payTo": PAY_TO})
     }
 
     fn x402(accepts: &[Json]) -> String {
@@ -548,10 +736,10 @@ mod tests {
     #[test]
     fn unreadable_listing_is_err() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(next_brief(&dir.path().join("missing.md"), None, &nothing()).is_err());
+        assert!(next_brief(&dir.path().join("missing.md"), None, &nothing(), &funded()).is_err());
 
         let open = write(dir.path(), "open.md", "---\nname: paid\nsummary: Paid\n");
-        assert!(next_brief(&open, None, &nothing()).is_err());
+        assert!(next_brief(&open, None, &nothing(), &funded()).is_err());
     }
 
     #[test]
@@ -717,6 +905,118 @@ mod tests {
                 "check: price\nrule: inconsistent prices across offers [0.01, 0.02]\n"
             ) && mixed.ends_with(STOP)
         );
+    }
+
+    #[test]
+    fn recipient_without_usdc_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "no-usdc.md", &valid(SUMMARY, &priced(0.01)));
+        assert_eq!(
+            answer(&path, &paying(), &rpc(Json::Null, json!([]))).unwrap(),
+            format!(
+                "check: payee\nrule: recipient has no USDC token account\ncurrent: {PAY_TO}\n\
+                 replacement: a wallet holding a USDC token account\n{STOP}"
+            )
+        );
+    }
+
+    #[test]
+    fn payee_asks_each_pair_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoints = "[{method: GET, path: /paid, description: Fetch the paid resource}, \
+                         {method: GET, path: /other, description: Fetch the other resource}]";
+        let path = write(dir.path(), "PAY.md", &valid(SUMMARY, endpoints));
+        let mut both = paying();
+        let raw = both.0[&("GET".to_string(), URL.to_string())].clone();
+        both.0
+            .insert(("GET".into(), "https://paid.example.com/other".into()), raw);
+        let rpc = funded();
+        assert_eq!(answer(&path, &both, &rpc), None);
+        assert_eq!(rpc.1.get(), 2);
+    }
+
+    #[test]
+    fn different_recipients_stop_before_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "PAY.md", &valid(SUMMARY, PAID));
+        let mut other = accept(SOLANA_MAINNET, "10000");
+        other["payTo"] = json!("Payee");
+        let rpc = funded();
+        assert_eq!(
+            answer(
+                &path,
+                &json_402(&x402(&[accept(SOLANA_MAINNET, "10000"), other])),
+                &rpc
+            )
+            .unwrap(),
+            format!(
+                "check: payee\nrule: 2 different recipients\ncurrent: {PAY_TO}, Payee\n\
+                 replacement: one payTo across offers\n{STOP}"
+            )
+        );
+        assert_eq!(rpc.1.get(), 0);
+    }
+
+    #[test]
+    fn non_solana_addresses_stop_before_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "PAY.md", &valid(SUMMARY, PAID));
+        let mut named = accept(SOLANA_MAINNET, "10000");
+        named["payTo"] = json!("Payee");
+        let mut unminted = accept(SOLANA_MAINNET, "10000");
+        unminted["asset"] = json!("not-base58");
+        let rpc = funded();
+        assert!(
+            answer(&path, &json_402(&x402(&[named])), &rpc)
+                .unwrap()
+                .starts_with("check: payee\nrule: payTo is not a Solana address\ncurrent: Payee\n")
+        );
+        assert!(
+            answer(&path, &json_402(&x402(&[unminted])), &rpc)
+                .unwrap()
+                .starts_with(
+                    "check: payee\nrule: asset is not a Solana address\ncurrent: not-base58\n"
+                )
+        );
+        assert_eq!(rpc.1.get(), 0);
+    }
+
+    #[test]
+    fn token_account_payee_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "PAY.md", &valid(SUMMARY, PAID));
+        let rpc = rpc(json!({"owner": TOKEN_PROGRAM}), json!([{"pubkey": USDC}]));
+        assert_eq!(
+            answer(&path, &paying(), &rpc).unwrap(),
+            format!(
+                "check: payee\nrule: payTo is a token account, not a wallet\ncurrent: {PAY_TO}\n\
+                 replacement: the wallet that owns this token account\n{STOP}"
+            )
+        );
+    }
+
+    #[test]
+    fn offer_without_pay_to_skips_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        let offer =
+            json!({"scheme": "exact", "network": SOLANA_MAINNET, "amount": "10000", "asset": USDC});
+        let header = recorded(
+            402,
+            &[("payment-required", STANDARD.encode(x402(&[offer])))],
+            "",
+        );
+        let even = write(dir.path(), "even.md", &valid(SUMMARY, &priced(0.01)));
+        let rpc = funded();
+        assert_eq!(answer(&even, &header, &rpc), None);
+        assert_eq!(rpc.1.get(), 0);
+    }
+
+    #[test]
+    fn unrecorded_rpc_is_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "PAY.md", &valid(SUMMARY, PAID));
+        let none = RecordedRpc(HashMap::new(), Cell::new(0));
+        assert!(next_brief(&path, None, &paying(), &none).is_err());
     }
 
     #[test]
