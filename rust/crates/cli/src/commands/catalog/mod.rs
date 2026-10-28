@@ -1,5 +1,6 @@
 pub mod build;
 pub mod check;
+pub mod next;
 pub mod probe;
 pub mod scaffold;
 pub mod verdict;
@@ -20,6 +21,8 @@ pub enum CatalogCommand {
     /// `dist/skills.json` + per-provider detail files. Used by main-branch
     /// CI on a green tree.
     Build(build::BuildCommand),
+    /// Print the first failing check on one PAY.md as a brief, or `green`.
+    Next(next::NextCommand),
 }
 
 impl CatalogCommand {
@@ -28,6 +31,7 @@ impl CatalogCommand {
             Self::Scaffold(cmd) => cmd.run(),
             Self::Check(cmd) => cmd.run(),
             Self::Build(cmd) => cmd.run(),
+            Self::Next(cmd) => cmd.run(),
         }
     }
 }
