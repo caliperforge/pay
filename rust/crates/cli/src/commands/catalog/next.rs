@@ -125,17 +125,19 @@ fn probe_brief(
     endpoints: &[ResolvedEndpoint],
     transport: &dyn Transport,
 ) -> pay_core::Result<Option<Brief>> {
-    let host = url_host(service_url)
-        .ok_or_else(|| pay_core::Error::Config(format!("service_url {service_url} has no host")))?;
-    if !transport.resolves(&host) {
+    let parsed = url_host(service_url);
+    let Some(host) = parsed.clone().filter(|h| transport.resolves(h)) else {
         return Ok(Some(Brief {
             check: "offer",
-            rule: format!("{host} does not resolve"),
+            rule: format!(
+                "{} does not resolve",
+                parsed.as_deref().unwrap_or(service_url)
+            ),
             current: service_url.to_string(),
             replacement: "a service_url whose host resolves".into(),
             stop: false,
         }));
-    }
+    };
     let mut offers = Vec::with_capacity(endpoints.len());
     for ep in endpoints {
         let url = format!(
@@ -560,6 +562,14 @@ mod tests {
             brief(&path, None, &nothing()),
             "check: offer\nrule: paid.example.com does not resolve\n\
              current: https://paid.example.com\nreplacement: a service_url whose host resolves\n"
+        );
+
+        let bare = valid(SUMMARY, PAID).replace("https://paid.example.com", "paid.example.com");
+        let bare = write(dir.path(), "bare.md", &bare);
+        assert_eq!(
+            brief(&bare, None, &paying()),
+            "check: offer\nrule: paid.example.com does not resolve\n\
+             current: paid.example.com\nreplacement: a service_url whose host resolves\n"
         );
     }
 

@@ -460,7 +460,6 @@ impl Transport for Recorded {
     }
 }
 
-/// Send the probe request for one endpoint.
 pub fn probe_response(
     transport: &dyn Transport,
     method: &str,
