@@ -9,6 +9,8 @@
 //! Downstream tooling (`pay skills build`) uses that to populate per-endpoint
 //! `pricing`, `protocol`, and `supported_usd` fields in the published index.
 
+use std::collections::HashMap;
+use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -16,7 +18,7 @@ use pay_types::Stablecoin;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::client::fetch::fetch_raw;
+use crate::client::fetch::{RawResponse, fetch_raw};
 use crate::client::runner::{self, RunOutcome};
 
 // ── Currency normalization ───────────────────────────────────────────────────
@@ -36,7 +38,7 @@ const MINT_MAP: &[(&str, &str, u8)] = &[
 
 /// Normalize a currency identifier to its symbol (uppercase).
 /// Recognizes known mint addresses and maps them to symbols.
-fn normalize_currency(raw: &str) -> String {
+pub fn normalize_currency(raw: &str) -> String {
     for (mint, symbol, _) in MINT_MAP {
         if raw == *mint {
             return symbol.to_string();
@@ -47,7 +49,7 @@ fn normalize_currency(raw: &str) -> String {
 
 /// Decimal scale for a currency symbol. Defaults to 6 (matches USDC/USDT) when
 /// unknown — every known x402 stablecoin uses 6 decimals.
-fn decimals_for(symbol: &str) -> u8 {
+pub fn decimals_for(symbol: &str) -> u8 {
     for (_, sym, decimals) in MINT_MAP {
         if symbol.eq_ignore_ascii_case(sym) {
             return *decimals;
@@ -70,7 +72,7 @@ fn is_solana_network(raw: &str) -> bool {
 }
 
 /// Convert a base-units string (e.g. `"10000"` of 6-decimal USDC) to USD.
-fn amount_to_usd(amount_str: &str, decimals: u8) -> Option<f64> {
+pub fn amount_to_usd(amount_str: &str, decimals: u8) -> Option<f64> {
     let raw: u128 = amount_str.parse().ok()?;
     let divisor = 10u128.pow(decimals as u32) as f64;
     Some(raw as f64 / divisor)
@@ -339,7 +341,7 @@ pub fn extract_paid_endpoint(headers: &[(String, String)], body: Option<&str>) -
 }
 
 /// Decode the base64 JSON envelope from the `payment-required` header, if any.
-fn parse_payment_required_header(headers: &[(String, String)]) -> Option<Value> {
+pub fn parse_payment_required_header(headers: &[(String, String)]) -> Option<Value> {
     use base64::Engine;
     let header_value = headers
         .iter()
@@ -401,19 +403,70 @@ fn probe_status_str(status: &ProbeStatus, http_status: u16, paid: &PaidEndpoint)
 
 // ── Probing ──────────────────────────────────────────────────────────────────
 
-/// Probe a single endpoint and classify the response.
-///
-/// `body_override` is a pre-rendered JSON request body — typically derived
-/// from the OpenAPI doc's `example` or schema. When `None` and the method
-/// expects a body, we fall back to `{}`.
-fn probe_endpoint(
+/// Where probe requests go: the network, or recorded responses.
+pub trait Transport {
+    fn fetch(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<&str>,
+    ) -> crate::Result<RawResponse>;
+    fn resolves(&self, host: &str) -> bool;
+}
+
+pub struct Live;
+
+impl Transport for Live {
+    fn fetch(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<&str>,
+    ) -> crate::Result<RawResponse> {
+        fetch_raw(method, url, headers, body)
+    }
+
+    fn resolves(&self, host: &str) -> bool {
+        (host, 443)
+            .to_socket_addrs()
+            .is_ok_and(|mut addrs| addrs.next().is_some())
+    }
+}
+
+/// Responses keyed by (uppercase method, url).
+pub struct Recorded(pub HashMap<(String, String), RawResponse>);
+
+impl Transport for Recorded {
+    fn fetch(
+        &self,
+        method: &str,
+        url: &str,
+        _headers: &[(String, String)],
+        _body: Option<&str>,
+    ) -> crate::Result<RawResponse> {
+        let method = method.to_uppercase();
+        self.0
+            .get(&(method.clone(), url.to_string()))
+            .cloned()
+            .ok_or_else(|| crate::Error::Config(format!("no recorded response for {method} {url}")))
+    }
+
+    fn resolves(&self, host: &str) -> bool {
+        self.0
+            .keys()
+            .any(|(_, url)| reqwest::Url::parse(url).is_ok_and(|url| url.host_str() == Some(host)))
+    }
+}
+
+/// Send the probe request for one endpoint.
+pub fn probe_response(
+    transport: &dyn Transport,
     method: &str,
     url: &str,
     body_override: Option<&str>,
-    config: &ProbeConfig,
-) -> EndpointProbeResult {
-    let start = Instant::now();
-
+) -> crate::Result<RawResponse> {
     let body = match method.to_uppercase().as_str() {
         "POST" | "PUT" | "PATCH" => Some(body_override.unwrap_or("{}")),
         _ => None,
@@ -423,8 +476,24 @@ fn probe_endpoint(
     } else {
         vec![]
     };
+    transport.fetch(method, url, &headers, body)
+}
 
-    let raw = fetch_raw(method, url, &headers, body);
+/// Probe a single endpoint and classify the response.
+///
+/// `body_override` is a pre-rendered JSON request body — typically derived
+/// from the OpenAPI doc's `example` or schema. When `None` and the method
+/// expects a body, we fall back to `{}`.
+fn probe_endpoint(
+    transport: &dyn Transport,
+    method: &str,
+    url: &str,
+    body_override: Option<&str>,
+    config: &ProbeConfig,
+) -> EndpointProbeResult {
+    let start = Instant::now();
+
+    let raw = probe_response(transport, method, url, body_override);
     let duration_ms = start.elapsed().as_millis() as u64;
 
     let (status, paid, probe_status, http_status) = match raw {
@@ -666,7 +735,7 @@ pub fn probe_provider(
             ep.path.trim_start_matches('/')
         );
         let mut result = if ep.metered {
-            probe_endpoint(&ep.method, &url, ep.body.as_deref(), config)
+            probe_endpoint(&Live, &ep.method, &url, ep.body.as_deref(), config)
         } else {
             EndpointProbeResult {
                 method: ep.method.clone(),
@@ -950,5 +1019,24 @@ mod tests {
         assert_eq!(amount_to_usd("1000000", 6), Some(1.0));
         assert_eq!(amount_to_usd("0", 6), Some(0.0));
         assert_eq!(amount_to_usd("not a number", 6), None);
+    }
+
+    #[test]
+    fn recorded_replays_only_what_was_recorded() {
+        let url = "https://paid.example.com/paid";
+        let raw = RawResponse {
+            url: url.into(),
+            status: 402,
+            headers: vec![],
+            body: b"{}".to_vec(),
+        };
+        let recorded = Recorded(HashMap::from([(("GET".into(), url.into()), raw)]));
+        assert_eq!(
+            probe_response(&recorded, "get", url, None).unwrap().status,
+            402
+        );
+        assert!(probe_response(&recorded, "POST", url, None).is_err());
+        assert!(recorded.resolves("paid.example.com"));
+        assert!(!recorded.resolves("other.example.com"));
     }
 }
